@@ -1,5 +1,5 @@
-#GridVet
-# Agentic Sandbox Security Framework
+# GridVet
+Agentic Sandbox Security Framework
 
 > A plug-and-play adversarial testing sandbox for AI crypto trading agents.
 
