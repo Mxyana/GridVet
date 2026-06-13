@@ -117,9 +117,9 @@ uvicorn main:app --reload
 
 ## Team Roles
 
-- **AppSec Technical Architect** — Node 2, Node 4, Node 5
-- **Software Engineer** — Node 1, Node 3
-- **Frontend Developer** — Node 6
+- **AppSec Engineer (Mxyana)** — Node 2, Node 4, Node 5
+- **Software Engineer (Prince Odein)** — Node 1, Node 3
+- **Frontend Developer/jnr Software Engineer** — Node 6
 
 ---
 
