@@ -1,0 +1,213 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-primary: #080808;
+  --bg-card: #111111;
+  --bg-hover: #161616;
+  --bg-input: #0f0f0f;
+  --border: #222222;
+  --border-subtle: #1a1a1a;
+  --text-primary: #e8e8e8;
+  --text-secondary: #888888;
+  --text-muted: #444444;
+  --gold: #c9a84c;
+  --gold-dim: #7a6030;
+  --green: #22c55e;
+  --red: #ef4444;
+  --amber: #f59e0b;
+  --grey-out: #3a3a3a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: "Inter", system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  text-decoration: none;
+  color: inherit;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+/* ----- Sidebar nav link hover ----- */
+.sidebar-link {
+  display: block;
+  margin-bottom: 2px;
+  text-decoration: none;
+}
+.sidebar-link:hover .sidebar-link-inner {
+  color: var(--text-primary) !important;
+  background: var(--bg-hover);
+}
+
+/* ----- Buttons ----- */
+.btn-outline-gold {
+  background: transparent;
+  border: 1px solid var(--gold);
+  color: var(--gold);
+  font-family: "Inter", sans-serif;
+  font-weight: 500;
+  font-size: 13px;
+  padding: 10px 20px;
+  border-radius: 6px;
+  transition: background 150ms ease, color 150ms ease;
+}
+.btn-outline-gold:hover:not(:disabled) {
+  background: var(--gold);
+  color: #080808;
+}
+.btn-outline-gold:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.btn-solid-gold {
+  width: 100%;
+  background: var(--gold);
+  color: #080808;
+  font-family: "Inter", sans-serif;
+  font-weight: 600;
+  font-size: 13px;
+  border-radius: 6px;
+  padding: 12px;
+  border: 1px solid var(--gold);
+  transition: background 150ms ease, opacity 150ms ease;
+}
+.btn-solid-gold:hover:not(:disabled) {
+  background: #d4b358;
+}
+.btn-solid-gold:disabled {
+  background: var(--gold-dim);
+  border-color: var(--gold-dim);
+  color: #080808;
+  cursor: not-allowed;
+}
+
+.btn-stop {
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--red);
+  color: var(--red);
+  font-family: "Inter", sans-serif;
+  font-weight: 500;
+  font-size: 13px;
+  padding: 10px;
+  border-radius: 6px;
+  transition: background 150ms ease, color 150ms ease;
+}
+.btn-stop:hover {
+  background: var(--red);
+  color: #080808;
+}
+
+.btn-advanced-toggle {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-family: "Inter", sans-serif;
+  font-size: 12px;
+  padding: 4px 0;
+  letter-spacing: 0.04em;
+  transition: color 150ms ease;
+}
+.btn-advanced-toggle:hover {
+  color: var(--gold);
+}
+
+/* ----- Animations ----- */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.fade-in {
+  animation: fadeIn 150ms ease both;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+.pulse-bar {
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes dotPulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 currentColor;
+    opacity: 1;
+  }
+  50% {
+    box-shadow: 0 0 0 4px transparent;
+    opacity: 0.6;
+  }
+}
+.dot-pulse {
+  animation: dotPulse 1.5s ease-in-out infinite;
+}
+
+@keyframes tierPulse {
+  0%,
+  100% {
+    box-shadow: 0 0 24px rgba(239, 68, 68, 0.25),
+      inset 0 0 12px rgba(239, 68, 68, 0.25);
+  }
+  50% {
+    box-shadow: 0 0 32px rgba(239, 68, 68, 0.45),
+      inset 0 0 16px rgba(239, 68, 68, 0.35);
+  }
+}
+.tier-pulse {
+  animation: tierPulse 2.4s ease-in-out infinite;
+}
+
+/* ----- Scrollbar (subtle) ----- */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #2c2c2c;
+}
+
+input::placeholder {
+  color: var(--text-muted);
+}
