@@ -1,5 +1,4 @@
-# GridVet
-Agentic Sandbox Security Framework
+# Agentic Sandbox Security Framework
 
 > A plug-and-play adversarial testing sandbox for AI crypto trading agents.
 
@@ -117,9 +116,9 @@ uvicorn main:app --reload
 
 ## Team Roles
 
-- **AppSec Engineer (Mxyana)** — Node 2, Node 4, Node 5
-- **Software Engineer (Prince Odein)** — Node 1, Node 3
-- **Frontend Developer/jnr Software Engineer** — Node 6
+- **AppSec Technical Architect** — Node 2, Node 4, Node 5
+- **Software Engineer** — Node 1, Node 3
+- **Frontend Developer** — Node 6
 
 ---
 
