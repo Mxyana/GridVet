@@ -10,10 +10,6 @@
 
 `Python 3.10+` `FastAPI` `React` `SSE` `SHA-256 Attestation` `Zero-Knowledge Verification`
 
-[![Bitget Hackathon](https://img.shields.io/badge/Bitget%20Hackathon-2025-orange?style=flat-square)]()
-[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)]()
-[![Python](https://img.shields.io/badge/python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)]()
-[![Architecture](https://img.shields.io/badge/architecture-6--Node%20Pipeline-8B5CF6?style=flat-square)]()
 
 </div>
 
