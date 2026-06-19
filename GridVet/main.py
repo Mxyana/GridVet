@@ -11,11 +11,16 @@ Run with:
 """
 
 import asyncio
+import hashlib
+import hmac
+import ipaddress
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 from fastapi import FastAPI, Header, HTTPException
@@ -47,6 +52,28 @@ GROQ_API_KEY_2 = os.getenv("GROQ_API_KEY_2")
 # misconfigured deployment fails closed rather than silently accepting any
 # caller.
 SANDBOX_ATTESTATION_TOKEN = os.getenv("SANDBOX_ATTESTATION_TOKEN")
+
+# Default-deny target policy. Only hostnames whose resolved IP falls in one
+# of the allowed networks may be registered as a test target. Operators can
+# extend the allow-list via SANDBOX_TARGET_ALLOWLIST (comma-separated CIDRs)
+# but the defaults are loopback + RFC1918 — i.e. systems the operator must
+# already control.
+_DEFAULT_TARGET_CIDRS = [
+    "127.0.0.0/8",
+    "::1/128",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+]
+_extra_cidrs = [
+    c.strip()
+    for c in (os.getenv("SANDBOX_TARGET_ALLOWLIST") or "").split(",")
+    if c.strip()
+]
+TARGET_ALLOWED_NETWORKS = [
+    ipaddress.ip_network(c, strict=False)
+    for c in (_DEFAULT_TARGET_CIDRS + _extra_cidrs)
+]
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +211,180 @@ def _append_run_history(*, terminal_status: str, tier: str) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to append run history: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Verifiable reporting (authorized runs only)
+# ---------------------------------------------------------------------------
+# Path is intentionally local + relative so the audit ledger stays alongside
+# the run. records.json is keyed by report_id; rewriting the whole map on
+# every terminal event is fine for the tens-to-hundreds of entries this
+# tool produces.
+RECORDS_PATH = "records.json"
+
+_BASE62_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def base62_encode(num: int) -> str:
+    """
+    Encode a non-negative integer as a Base62 string using 0-9a-zA-Z.
+
+    Self-contained (no external deps) so the audit IDs stay reproducible
+    even if optional packages drift. ``num == 0`` returns ``"0"``.
+    """
+    if num < 0:
+        raise ValueError("base62_encode requires a non-negative integer")
+    if num == 0:
+        return "0"
+    out = []
+    while num > 0:
+        num, rem = divmod(num, 62)
+        out.append(_BASE62_ALPHABET[rem])
+    return "".join(reversed(out))
+
+
+def build_report_id(bot_name: str, timestamp_ms: int) -> str:
+    """
+    Build a compact, URL-safe report ID like ``GR-K7x9aQ``.
+
+    Layout: ``<2-letter uppercase bot prefix>-<base62(timestamp_ms)>``.
+    Short bot names are right-padded with ``X`` so the prefix is always
+    exactly two characters; non-alphanumerics in the prefix are stripped.
+    """
+    cleaned = "".join(ch for ch in (bot_name or "") if ch.isalnum()).upper()
+    prefix = (cleaned[:2] or "XX").ljust(2, "X")
+    return f"{prefix}-{base62_encode(int(timestamp_ms))}"
+
+
+def save_verification_record(
+    report_id: str,
+    *,
+    bot_name: str,
+    timestamp_ms: int,
+    secure_hash: str,
+    status: str,
+    records_path: str = RECORDS_PATH,
+) -> None:
+    """
+    Insert/replace the verification entry for ``report_id`` in records.json.
+
+    Writes via a temp file + ``os.replace`` so a crash mid-write cannot
+    leave a half-written ledger. A corrupt or missing existing file is
+    treated as empty rather than fatal — the new entry still lands.
+    """
+    try:
+        with open(records_path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+        if not isinstance(records, dict):
+            records = {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        records = {}
+
+    records[report_id] = {
+        "bot_name": bot_name,
+        "timestamp_ms": timestamp_ms,
+        "secure_hash": secure_hash,
+        "status": status,
+    }
+
+    tmp_path = records_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, records_path)
+
+
+def _final_report_text() -> str:
+    """
+    Materialize the canonical 'final report' string for hashing.
+
+    The run loop never builds a single report string of its own; the report
+    is assembled on demand from ``ResultEngine.get_full_report()``. We
+    serialize that dict with ``sort_keys=True`` so the same logical report
+    always produces the same SHA-256 — hash stability is the whole point.
+    Returns ``"{}"`` if Node 5 was never instantiated (e.g. crash before
+    the first packet).
+    """
+    engine = APP_STATE.get("result_engine")
+    report_obj = engine.get_full_report() if engine is not None else {}
+    return json.dumps(report_obj, sort_keys=True, ensure_ascii=False)
+
+
+def save_report_file(report_id: str, report_text: str) -> str:
+    """
+    Write the final security report to disk using the Base62 ``report_id``
+    as the filename (e.g. ``reports/GR-K7x9aQ.txt``).
+
+    The ``report_id`` is used **strictly and only** for the filename.  It is
+    never injected into, appended to, or embedded in the file contents.
+    This keeps the cryptographic payload (``report_text``) completely
+    separate from the metadata identifier so that the SHA-256 recorded in
+    ``records.json`` can be verified against the raw file contents without
+    any ID-dependent bias.
+
+    Parameters
+    ----------
+    report_id : str
+        Base62 report identifier produced by ``build_report_id()``.
+    report_text : str
+        Canonical JSON string of the report (output of ``_final_report_text()``).
+
+    Returns
+    -------
+    str
+        Absolute path of the written file.
+    """
+    reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    filepath = os.path.join(reports_dir, f"{report_id}.txt")
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(report_text)
+    logger.info("REPORT FILE — saved %s", filepath)
+    return filepath
+
+
+def emit_verification(status: str) -> dict:
+    """
+    Generate the report_id + SHA-256 for the just-finished run and persist
+    them to ``records.json``. Called from the three terminal points of
+    ``run_pipeline`` (COMPLETE / STOPPED / ERROR). Never raises — audit
+    logging must not be able to mask the pipeline's real terminal state.
+    """
+    try:
+        bot_name = APP_STATE.get("agent_name") or "Unknown"
+        timestamp_ms = int(time.time() * 1000)
+        report_text = _final_report_text()
+        secure_hash = hashlib.sha256(report_text.encode("utf-8")).hexdigest()
+        report_id = build_report_id(bot_name, timestamp_ms)
+
+        save_verification_record(
+            report_id,
+            bot_name=bot_name,
+            timestamp_ms=timestamp_ms,
+            secure_hash=secure_hash,
+            status=status,
+        )
+
+        # Persist the report payload to disk, keyed by report_id filename.
+        # The report_id is used ONLY as the filename — never written into
+        # the file contents (see save_report_file docstring).
+        save_report_file(report_id, report_text)
+
+        logger.info(
+            "VERIFICATION — id=%s | status=%s | sha256=%s…",
+            report_id,
+            status,
+            secure_hash[:12],
+        )
+        return {
+            "report_id": report_id,
+            "bot_name": bot_name,
+            "timestamp_ms": timestamp_ms,
+            "secure_hash": secure_hash,
+            "status": status,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to emit verification record: %s", exc)
+        return {}
 
 
 def _call_agent(agent_input: dict) -> Optional[dict]:
@@ -355,10 +556,12 @@ async def run_pipeline(
                 logger.info("Pipeline halted by stop request.")
                 APP_STATE["status"] = "STOPPED"
                 _append_run_history(terminal_status="STOPPED", tier=tier)
+                verification = emit_verification("STOPPED")
                 await SSE_QUEUE.put(
                     {
                         "event": "STOPPED",
                         "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "verification": verification,
                     }
                 )
                 return
@@ -457,6 +660,7 @@ async def run_pipeline(
         # Run finished naturally
         APP_STATE["status"] = "COMPLETE"
         _append_run_history(terminal_status="COMPLETE", tier=tier)
+        verification = emit_verification("COMPLETE")
 
         try:
             stats = (
@@ -472,17 +676,20 @@ async def run_pipeline(
             {
                 "event": "COMPLETE",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "verification": verification,
             }
         )
 
     except Exception as outer_exc:  # noqa: BLE001
         logger.exception("Pipeline crashed: %s", outer_exc)
         APP_STATE["status"] = "ERROR"
+        verification = emit_verification("ERROR")
         await SSE_QUEUE.put(
             {
                 "event": "ERROR",
                 "error": str(outer_exc),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "verification": verification,
             }
         )
 
@@ -505,6 +712,7 @@ async def register_agent(req: RegisterAgentRequest) -> dict:
         "agent_name": req.agent_name,
         "agent_endpoint": req.agent_endpoint,
     }
+
 
 @app.post("/run-test")
 async def run_test(req: RunTestRequest = RunTestRequest()) -> dict:
