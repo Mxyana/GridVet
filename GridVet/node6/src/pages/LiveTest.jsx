@@ -77,6 +77,27 @@ function StatusPill({ status }) {
       </span>
     );
   }
+  if (status === "ERROR") {
+    return (
+      <span
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 6,
+          padding: "4px 12px",
+          borderRadius: 999,
+          background: "rgba(239,68,68,0.12)",
+          border: "1px solid rgba(239,68,68,0.3)",
+          color: "var(--red)",
+          fontFamily: "Inter, sans-serif",
+          fontSize: 12,
+          fontWeight: 500,
+        }}
+      >
+        Error
+      </span>
+    );
+  }
   return (
     <span
       style={{
@@ -119,23 +140,23 @@ export default function LiveTest() {
     } catch {}
   }, []);
 
-  // Derive RUNNING / COMPLETE / STOPPED state from the SSE stream itself.
-  // The backend pushes terminal {"event": "COMPLETE"} / {"event": "STOPPED"}
-  // events at the end of a run — when we see one we flip status immediately
-  // so the user is prompted to head back to the dashboard without having to
-  // hit Stop manually.
   useEffect(() => {
     let source;
     let hadAny = false;
+    
+    const sessionId = sessionStorage.getItem("gridvet_session_id");
+    if (!sessionId) {
+      setStatus("ERROR");
+      setStopMsg({ ok: false, message: "No active session ID. Please register again." });
+      return;
+    }
+
     try {
-      // ⚡ BACKEND: SSE API.STREAM — used here to derive run status
-      source = new EventSource(API.STREAM);
+      // Stream is now tied to the isolated session
+      source = new EventSource(API.STREAM(sessionId));
       source.onopen = () => setStatus("RUNNING");
       source.onmessage = (event) => {
         hadAny = true;
-
-        // Try to parse the event payload. Non-JSON or non-terminal events
-        // simply keep us in RUNNING.
         let parsed = null;
         try {
           parsed = JSON.parse(event.data);
@@ -147,8 +168,7 @@ export default function LiveTest() {
           setStatus("COMPLETE");
           setStopMsg({
             ok: true,
-            message:
-              "Test complete. Return to Dashboard to view your agent's report card.",
+            message: "Test complete. Return to Dashboard to view your agent's report card.",
           });
           if (source) source.close();
           return;
@@ -157,8 +177,7 @@ export default function LiveTest() {
           setStatus("STOPPED");
           setStopMsg({
             ok: true,
-            message:
-              "Test stopped. Return to Dashboard to view your agent's report card.",
+            message: "Test stopped. Return to Dashboard to view your agent's report card.",
           });
           if (source) source.close();
           return;
@@ -185,9 +204,15 @@ export default function LiveTest() {
 
   const handleStop = async () => {
     setStopMsg(null);
+    const sessionId = sessionStorage.getItem("gridvet_session_id");
+    
+    if (!sessionId) {
+      setStopMsg({ ok: false, message: "No session found to stop." });
+      return;
+    }
+
     try {
-      // ⚡ BACKEND: POST API.STOP_TEST — halts the current run
-      const res = await fetch(API.STOP_TEST, { method: "POST" });
+      const res = await fetch(API.STOP_TEST(sessionId), { method: "POST" });
       if (!res.ok) throw new Error("stop failed");
       setStatus("STOPPED");
       setStopMsg({ ok: true, message: "Test stopped. Return to Dashboard to view your agent's report card." });
@@ -201,7 +226,6 @@ export default function LiveTest() {
 
   return (
     <div style={{ maxWidth: 1280, margin: "0 auto" }}>
-      {/* Top bar */}
       <div
         style={{
           display: "flex",
@@ -237,7 +261,6 @@ export default function LiveTest() {
         <StatusPill status={status} />
       </div>
 
-      {/* Two-column layout */}
       <div
         className="livetest-grid"
         style={{
@@ -246,12 +269,10 @@ export default function LiveTest() {
           gap: 20,
         }}
       >
-        {/* Left: live feed */}
         <div>
           <LiveFeed />
         </div>
 
-        {/* Right: report + controls */}
         <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
           <AgentReport status={status} />
 
@@ -275,10 +296,7 @@ export default function LiveTest() {
             >
               Run Controls
             </div>
-            <button
-              onClick={handleStop}
-              className="btn-stop"
-            >
+            <button onClick={handleStop} className="btn-stop">
               Stop Test
             </button>
             {stopMsg && (
