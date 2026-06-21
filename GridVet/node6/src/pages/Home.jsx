@@ -3,9 +3,6 @@ import { useNavigate } from "react-router-dom";
 import { API } from "../constants/api.js";
 import TierBadge from "../components/TierBadge.jsx";
 
-// NOTE FOR LIVETEST.JSX: Add this text somewhere visible:
-// "Test complete? Return to Dashboard to view your agent's report card."
-
 const cardStyle = {
   background: "var(--bg-card)",
   border: "1px solid var(--border)",
@@ -35,7 +32,6 @@ const labelStyle = {
   letterSpacing: "0.02em",
 };
 
-// ---- Status pill colour map for the mini vulnerability summary ----
 const VULN_STATUS_STYLES = {
   RESISTED: {
     label: "Resisted",
@@ -71,10 +67,9 @@ function tierLabelColor(tier) {
   if (t === "S") return "#ffd700";
   if (t === "A") return "#d1d5db";
   if (t === "B") return "#60a5fa";
-  return "var(--red)"; // C, D
+  return "var(--red)"; 
 }
 
-// ---- Test tier configuration ----
 const TEST_TIERS = [
   {
     key: "Quick",
@@ -101,32 +96,26 @@ const TEST_MODES = [
 export default function Home() {
   const navigate = useNavigate();
 
-  // ---- Existing state ----
   const [agentName, setAgentName] = useState("");
   const [agentEndpoint, setAgentEndpoint] = useState("");
-  const [regStatus, setRegStatus] = useState(null); // {ok, message}
+  const [regStatus, setRegStatus] = useState(null); 
   const [registering, setRegistering] = useState(false);
   const [starting, setStarting] = useState(false);
 
-  const [history, setHistory] = useState(null); // null = loading, [] = empty, array = data
+  const [history, setHistory] = useState(null); 
   const [historyError, setHistoryError] = useState(false);
 
-  // ---- New report-card state ----
-  const [testStatus, setTestStatus] = useState("IDLE"); // IDLE/RUNNING/COMPLETE/STOPPED/ERROR
+  const [testStatus, setTestStatus] = useState("IDLE"); 
   const [reportData, setReportData] = useState(null);
   const [narrative, setNarrative] = useState("");
   const [cardLoading, setCardLoading] = useState(false);
   const [cardError, setCardError] = useState("");
 
-  // ---- Test configuration state ----
   const [selectedTier, setSelectedTier] = useState("Standard");
   const [selectedMode, setSelectedMode] = useState("Practice");
 
   const pollRef = useRef(null);
 
-  // -------------------------------------------------------------------
-  // Initial: load history + restore registered agent from sessionStorage
-  // -------------------------------------------------------------------
   useEffect(() => {
     try {
       const storedName = sessionStorage.getItem("gridvet_agent_name");
@@ -136,9 +125,6 @@ export default function Home() {
     } catch {}
 
     let cancelled = false;
-    // ⚡ BACKEND: GET API.TEST_HISTORY — fetches past test run summaries
-    // The endpoint now returns { history: [...], count: N } (the new
-    // run_history.json shape), not a bare array.
     (async () => {
       try {
         const res = await fetch(API.TEST_HISTORY);
@@ -162,26 +148,22 @@ export default function Home() {
     };
   }, []);
 
-  // -------------------------------------------------------------------
-  // Background status polling — runs on mount, regardless of local state.
-  // If a test was started in another tab (or this page was reloaded mid-run)
-  // we still detect the COMPLETE / STOPPED transition and auto-fetch the
-  // report card without the user having to click anything.
-  // -------------------------------------------------------------------
   useEffect(() => {
     let stopped = false;
-    let lastTriggeredFor = null; // avoid double-fetching the same terminal state
+    let lastTriggeredFor = null; 
 
-    // ⚡ BACKEND: GET API.STATUS — polled every 3s in the background
     pollRef.current = setInterval(async () => {
       if (stopped) return;
+      
+      const sessionId = sessionStorage.getItem("gridvet_session_id");
+      if (!sessionId) return; // Skip polling if no active session ID exists
+
       try {
-        const res = await fetch(API.STATUS);
+        const res = await fetch(API.STATUS(sessionId));
         if (!res.ok) throw new Error("bad status");
         const data = await res.json();
         const next = data.status;
 
-        // Mirror backend state into local state.
         setTestStatus((prev) => (prev !== next ? next : prev));
 
         if (next === "COMPLETE" || next === "STOPPED") {
@@ -191,7 +173,7 @@ export default function Home() {
               clearInterval(pollRef.current);
               pollRef.current = null;
             }
-            fetchReportAndGenerate();
+            fetchReportAndGenerate(sessionId);
           }
         } else if (next === "ERROR") {
           if (pollRef.current) {
@@ -211,22 +193,21 @@ export default function Home() {
         pollRef.current = null;
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // -------------------------------------------------------------------
-  // Report fetch + narrative generation
-  // -------------------------------------------------------------------
-  async function fetchReportAndGenerate() {
+  async function fetchReportAndGenerate(sessionId) {
+    if (!sessionId) {
+      setCardError("Session missing. Please re-register the agent.");
+      return;
+    }
     setCardLoading(true);
     setCardError("");
     try {
-      // ⚡ BACKEND: GET API.REPORT — fetch full test results
-      const reportRes = await fetch(API.REPORT);
+      const reportRes = await fetch(API.REPORT(sessionId));
+      if (!reportRes.ok) throw new Error("Failed to fetch report");
       const report = await reportRes.json();
       setReportData(report);
 
-      // ⚡ BACKEND: POST API.GENERATE_REPORT_CARD — Groq narrative
       const cardRes = await fetch(API.GENERATE_REPORT_CARD, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -244,38 +225,26 @@ export default function Home() {
     }
   }
 
-  // -------------------------------------------------------------------
-  // Pure-frontend download (no backend call)
-  // -------------------------------------------------------------------
-function downloadReport() {
-  const rawMasterText = reportData?.raw_master_text;
-  const sessionKey = reportData?.report_id;
+  function downloadReport() {
+    const rawMasterText = reportData?.raw_master_text;
+    const sessionKey = reportData?.report_id;
 
-  if (!rawMasterText || !sessionKey) {
-    console.error("Missing raw_master_text or report_id");
-    return;
+    if (!rawMasterText || !sessionKey) {
+      console.error("Missing raw_master_text or report_id");
+      return;
+    }
+
+    const blob = new Blob([rawMasterText], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${sessionKey}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   }
 
-  const blob = new Blob([rawMasterText], {
-    type: "text/plain",
-  });
-
-  const url = URL.createObjectURL(blob);
-
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `${sessionKey}.txt`;
-
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-
-  URL.revokeObjectURL(url);
-}
-
-  // -------------------------------------------------------------------
-  // Registration + start handlers (existing behaviour, lightly augmented)
-  // -------------------------------------------------------------------
   const handleRegister = async () => {
     if (!agentName || !agentEndpoint) {
       setRegStatus({ ok: false, message: "Please fill in both fields." });
@@ -284,7 +253,6 @@ function downloadReport() {
     setRegistering(true);
     setRegStatus(null);
     try {
-      // ⚡ BACKEND: POST API.REGISTER_AGENT — registers agent endpoint
       const res = await fetch(API.REGISTER_AGENT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -294,10 +262,17 @@ function downloadReport() {
         }),
       });
       if (!res.ok) throw new Error("register failed");
+      
+      const data = await res.json();
+      
       try {
         sessionStorage.setItem("gridvet_agent_name", agentName);
         sessionStorage.setItem("gridvet_agent_endpoint", agentEndpoint);
+        if (data.session_id) {
+          sessionStorage.setItem("gridvet_session_id", data.session_id);
+        }
       } catch {}
+      
       setRegStatus({ ok: true, message: `Agent registered: ${agentName}` });
     } catch (e) {
       setRegStatus({
@@ -310,24 +285,29 @@ function downloadReport() {
   };
 
   const handleStart = async () => {
+    const sessionId = sessionStorage.getItem("gridvet_session_id");
+    if (!sessionId) {
+      alert("No active session found. Please register your agent first.");
+      return;
+    }
+    
     setStarting(true);
-    // Clear any previous report so the right panel shows the running state.
     setReportData(null);
     setNarrative("");
     setCardError("");
+    
     try {
-      // ⚡ BACKEND: POST API.RUN_TEST — triggers the full sandbox pipeline
       await fetch(API.RUN_TEST, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           tier: selectedTier,
           mode: selectedMode,
+          session_id: sessionId
         }),
       });
       setTestStatus("RUNNING");
     } catch (e) {
-      // Even if backend not reachable, still navigate so user can see UI.
       setTestStatus("RUNNING");
     } finally {
       setStarting(false);
@@ -335,12 +315,8 @@ function downloadReport() {
     }
   };
 
-  // -------------------------------------------------------------------
-  // Render
-  // -------------------------------------------------------------------
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto" }}>
-      {/* Header */}
       <div style={{ marginBottom: 32 }}>
         <h1
           style={{
@@ -353,20 +329,12 @@ function downloadReport() {
         >
           Agent Registration
         </h1>
-        <p
-          style={{
-            color: "var(--text-secondary)",
-            fontSize: 14,
-            marginTop: 6,
-          }}
-        >
+        <p style={{ color: "var(--text-secondary)", fontSize: 14, marginTop: 6 }}>
           Connect your trading agent to the sandbox.
         </p>
       </div>
 
-      {/* Two-column layout */}
       <div className="home-grid">
-        {/* LEFT COLUMN (60%) — existing registration + run test */}
         <div className="home-left">
           {renderRegistrationCard({
             agentName,
@@ -387,8 +355,6 @@ function downloadReport() {
           })}
           {renderRecentTests({ history, historyError })}
         </div>
-
-        {/* RIGHT COLUMN (40%) — report card panel */}
         <div className="home-right">
           {renderReportCard({
             agentName,
@@ -403,7 +369,6 @@ function downloadReport() {
         </div>
       </div>
 
-      {/* Responsive layout — scoped to this page */}
       <style>{`
         .home-grid {
           display: flex;
@@ -435,10 +400,6 @@ function downloadReport() {
     </div>
   );
 }
-
-/* =================================================================
-   Left column sub-renders — kept inside this file to preserve scope
-   ================================================================= */
 
 function renderRegistrationCard({
   agentName,
@@ -553,7 +514,6 @@ function renderRunTestCard({
         injection engine and reach your agent.
       </p>
 
-      {/* Tier selection cards */}
       <div style={{ marginBottom: 20 }}>
         <label style={labelStyle}>Test Tier</label>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
@@ -615,7 +575,6 @@ function renderRunTestCard({
         </div>
       </div>
 
-      {/* Mode toggle */}
       <div style={{ marginBottom: 24 }}>
         <label style={labelStyle}>Test Mode</label>
         <div style={{ display: "flex", gap: 10 }}>
@@ -696,7 +655,7 @@ function renderRecentTests({ history, historyError }) {
 
       {history === null && (
         <div>
-          {[0, 1, 2].map((i) => (
+          {map((i) => (
             <div
               key={i}
               className="pulse-bar"
@@ -790,10 +749,6 @@ function renderRecentTests({ history, historyError }) {
   );
 }
 
-/* =================================================================
-   Right column — REPORT CARD with 4 states
-   ================================================================= */
-
 function renderReportCard({
   agentName,
   agentEndpoint,
@@ -812,70 +767,29 @@ function renderReportCard({
     minHeight: 400,
   };
 
-  // STATE: Error overrides everything
   if (cardError) {
     return (
-      <div
-        style={{
-          ...baseCard,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          textAlign: "center",
-        }}
-      >
-        <div
-          style={{
-            color: "var(--red)",
-            fontSize: 12,
-            fontFamily: "Inter, sans-serif",
-          }}
-        >
+      <div style={{ ...baseCard, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center" }}>
+        <div style={{ color: "var(--red)", fontSize: 12, fontFamily: "Inter, sans-serif" }}>
           {cardError}
         </div>
       </div>
     );
   }
 
-  // STATE 1: No agent registered
   if (!agentName) {
     return (
-      <div
-        style={{
-          ...baseCard,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          textAlign: "center",
-        }}
-      >
-        <div
-          style={{
-            color: "var(--text-muted)",
-            fontStyle: "italic",
-            fontSize: 13,
-            fontFamily: "Inter, sans-serif",
-          }}
-        >
+      <div style={{ ...baseCard, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center" }}>
+        <div style={{ color: "var(--text-muted)", fontStyle: "italic", fontSize: 13, fontFamily: "Inter, sans-serif" }}>
           Register your agent to generate a security report.
         </div>
       </div>
     );
   }
 
-  // STATE 3: Running OR generating narrative
   if (testStatus === "RUNNING" || cardLoading) {
     return (
-      <div
-        style={{
-          ...baseCard,
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          justifyContent: "center",
-          gap: 18,
-        }}
-      >
+      <div style={{ ...baseCard, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 18 }}>
         <div
           style={{
             width: 36,
@@ -886,13 +800,7 @@ function renderReportCard({
             animation: "homeSpin 0.9s linear infinite",
           }}
         />
-        <div
-          style={{
-            color: "var(--text-secondary)",
-            fontSize: 13,
-            fontFamily: "Inter, sans-serif",
-          }}
-        >
+        <div style={{ color: "var(--text-secondary)", fontSize: 13, fontFamily: "Inter, sans-serif" }}>
           Generating security report...
         </div>
         <style>{`
@@ -905,67 +813,22 @@ function renderReportCard({
     );
   }
 
-  // STATE 4: Complete — show full card
   if (reportData && narrative) {
-    return renderCompletedReportCard({
-      agentName,
-      agentEndpoint,
-      reportData,
-      narrative,
-      downloadReport,
-      baseCard,
-    });
+    return renderCompletedReportCard({ agentName, agentEndpoint, reportData, narrative, downloadReport, baseCard });
   }
 
-  // STATE 2: Agent registered, test not started
   return (
     <div style={baseCard}>
-      <div
-        style={{
-          color: "var(--text-secondary)",
-          fontFamily: "Inter, sans-serif",
-          fontWeight: 500,
-          fontSize: 11,
-          letterSpacing: "0.12em",
-          textTransform: "uppercase",
-          marginBottom: 14,
-        }}
-      >
+      <div style={{ color: "var(--text-secondary)", fontFamily: "Inter, sans-serif", fontWeight: 500, fontSize: 11, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 14 }}>
         Registered Agent
       </div>
-      <div
-        style={{
-          color: "var(--text-primary)",
-          fontFamily: "Inter, sans-serif",
-          fontWeight: 600,
-          fontSize: 15,
-          marginBottom: 4,
-        }}
-      >
+      <div style={{ color: "var(--text-primary)", fontFamily: "Inter, sans-serif", fontWeight: 600, fontSize: 15, marginBottom: 4 }}>
         {agentName}
       </div>
-      <div
-        style={{
-          color: "var(--text-muted)",
-          fontFamily: "'JetBrains Mono', monospace",
-          fontSize: 11,
-          whiteSpace: "nowrap",
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          marginBottom: 28,
-        }}
-        title={agentEndpoint}
-      >
+      <div style={{ color: "var(--text-muted)", fontFamily: "'JetBrains Mono', monospace", fontSize: 11, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", marginBottom: 28 }} title={agentEndpoint}>
         {agentEndpoint || "—"}
       </div>
-      <div
-        style={{
-          color: "var(--text-secondary)",
-          fontSize: 13,
-          fontFamily: "Inter, sans-serif",
-          lineHeight: 1.55,
-        }}
-      >
+      <div style={{ color: "var(--text-secondary)", fontSize: 13, fontFamily: "Inter, sans-serif", lineHeight: 1.55 }}>
         Start the test to generate your security report.
       </div>
     </div>
@@ -982,10 +845,7 @@ function renderCompletedReportCard({
 }) {
   const agentReport = reportData?.agent_report || {};
   const tier = agentReport.tier || "C";
-  const score =
-    typeof agentReport.security_score === "number"
-      ? agentReport.security_score
-      : 0;
+  const score = typeof agentReport.security_score === "number" ? agentReport.security_score : 0;
   const primaryLabel = agentReport.primary_label || "—";
   const vuln = agentReport.vulnerability_by_type || {};
   const adv = reportData?.advanced || {};
@@ -993,153 +853,56 @@ function renderCompletedReportCard({
   const packetsProcessed = adv.packets_processed ?? adv.total_packets_processed ?? 0;
   const packetsPlanned = adv.packets_planned ?? adv.total_packets_processed ?? 0;
 
-  const divider = {
-    height: 1,
-    background: "var(--border-subtle)",
-    margin: "18px 0",
-  };
-
-  const sectionLabel = {
-    color: "var(--text-secondary)",
-    fontFamily: "Inter, sans-serif",
-    fontWeight: 500,
-    fontSize: 11,
-    letterSpacing: "0.08em",
-    textTransform: "uppercase",
-    marginBottom: 8,
-  };
+  const divider = { height: 1, background: "var(--border-subtle)", margin: "18px 0" };
+  const sectionLabel = { color: "var(--text-secondary)", fontFamily: "Inter, sans-serif", fontWeight: 500, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 8 };
 
   return (
     <div style={baseCard}>
-      {/* A — Agent header */}
       <div>
-        <div
-          style={{
-            color: "var(--text-primary)",
-            fontFamily: "Inter, sans-serif",
-            fontWeight: 600,
-            fontSize: 15,
-            marginBottom: 4,
-          }}
-        >
+        <div style={{ color: "var(--text-primary)", fontFamily: "Inter, sans-serif", fontWeight: 600, fontSize: 15, marginBottom: 4 }}>
           {agentName}
         </div>
-        <div
-          style={{
-            color: "var(--text-muted)",
-            fontFamily: "'JetBrains Mono', monospace",
-            fontSize: 11,
-            whiteSpace: "nowrap",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-          }}
-          title={agentEndpoint}
-        >
+        <div style={{ color: "var(--text-muted)", fontFamily: "'JetBrains Mono', monospace", fontSize: 11, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={agentEndpoint}>
           {agentEndpoint || "—"}
         </div>
       </div>
 
-      {/* B — Divider */}
       <div style={divider} />
 
-      {/* INCOMPLETE badge — shown above tier/score if test was halted early */}
       {isIncomplete && (
         <div style={{ marginBottom: 16 }}>
-          <span
-            style={{
-              display: "inline-block",
-              fontFamily: "Inter, sans-serif",
-              fontWeight: 700,
-              fontSize: 11,
-              letterSpacing: "0.1em",
-              textTransform: "uppercase",
-              padding: "4px 12px",
-              borderRadius: 4,
-              background: "rgba(239,68,68,0.15)",
-              border: "1px solid rgba(239,68,68,0.5)",
-              color: "var(--red)",
-            }}
-          >
+          <span style={{ display: "inline-block", fontFamily: "Inter, sans-serif", fontWeight: 700, fontSize: 11, letterSpacing: "0.1em", textTransform: "uppercase", padding: "4px 12px", borderRadius: 4, background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.5)", color: "var(--red)" }}>
             Incomplete
           </span>
-          <div
-            style={{
-              marginTop: 6,
-              fontFamily: "Inter, sans-serif",
-              fontSize: 12,
-              color: "var(--text-secondary)",
-              lineHeight: 1.5,
-            }}
-          >
-            Tested {packetsProcessed} of {packetsPlanned} planned attacks
-            — results reflect partial coverage.
+          <div style={{ marginTop: 6, fontFamily: "Inter, sans-serif", fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.5 }}>
+            Tested {packetsProcessed} of {packetsPlanned} planned attacks — results reflect partial coverage.
           </div>
         </div>
       )}
 
-      {/* C — Tier + Score row */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: 16,
-        }}
-      >
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16 }}>
         <TierBadge tier={tier} size="lg" />
         <div style={{ textAlign: "right" }}>
-          <div
-            style={{
-              fontFamily: "Inter, sans-serif",
-              fontWeight: 700,
-              fontSize: 28,
-              color: "var(--text-primary)",
-              lineHeight: 1,
-              letterSpacing: "-0.02em",
-            }}
-          >
+          <div style={{ fontFamily: "Inter, sans-serif", fontWeight: 700, fontSize: 28, color: "var(--text-primary)", lineHeight: 1, letterSpacing: "-0.02em" }}>
             {Number(score).toFixed(1)}%
           </div>
-          <div
-            style={{
-              marginTop: 8,
-              fontSize: 12,
-              color: tierLabelColor(tier),
-              fontFamily: "Inter, sans-serif",
-              fontWeight: 500,
-            }}
-          >
+          <div style={{ marginTop: 8, fontSize: 12, color: tierLabelColor(tier), fontFamily: "Inter, sans-serif", fontWeight: 500 }}>
             {primaryLabel}
           </div>
         </div>
       </div>
 
-      {/* D — Divider */}
       <div style={divider} />
 
-      {/* E — AI narrative */}
       <div>
         <div style={sectionLabel}>AI Assessment</div>
-        <div
-          style={{
-            fontFamily: "Inter, sans-serif",
-            fontWeight: 400,
-            fontSize: 13,
-            color: "var(--text-primary)",
-            lineHeight: 1.6,
-            maxHeight: 160,
-            overflowY: "auto",
-            paddingRight: 6,
-          }}
-        >
+        <div style={{ fontFamily: "Inter, sans-serif", fontWeight: 400, fontSize: 13, color: "var(--text-primary)", lineHeight: 1.6, maxHeight: 160, overflowY: "auto", paddingRight: 6 }}>
           {narrative}
         </div>
       </div>
 
-      {/* F — Divider */}
       <div style={divider} />
 
-      {/* G — Mini vulnerability summary */}
       <div>
         <div style={sectionLabel}>Vulnerabilities</div>
         <div style={{ display: "flex", flexDirection: "column" }}>
@@ -1147,38 +910,11 @@ function renderCompletedReportCard({
             const status = (vuln[key] || "UNTESTED").toString().toUpperCase();
             const s = VULN_STATUS_STYLES[status] || VULN_STATUS_STYLES.UNTESTED;
             return (
-              <div
-                key={key}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  padding: "6px 0",
-                  borderBottom: "1px solid var(--border-subtle)",
-                }}
-              >
-                <span
-                  style={{
-                    fontFamily: "'JetBrains Mono', monospace",
-                    fontSize: 11,
-                    color: "var(--text-primary)",
-                  }}
-                >
+              <div key={key} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid var(--border-subtle)" }}>
+                <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: "var(--text-primary)" }}>
                   {ATTACK_LABELS[key]}
                 </span>
-                <span
-                  style={{
-                    display: "inline-block",
-                    fontFamily: "Inter, sans-serif",
-                    fontSize: 11,
-                    padding: "2px 8px",
-                    borderRadius: 999,
-                    background: s.bg,
-                    color: s.color,
-                    border: `1px solid ${s.border}`,
-                    fontWeight: 500,
-                  }}
-                >
+                <span style={{ display: "inline-block", fontFamily: "Inter, sans-serif", fontSize: 11, padding: "2px 8px", borderRadius: 999, background: s.bg, color: s.color, border: `1px solid ${s.border}`, fontWeight: 500 }}>
                   {s.label}
                 </span>
               </div>
@@ -1187,13 +923,8 @@ function renderCompletedReportCard({
         </div>
       </div>
 
-      {/* H — Download button */}
       <div style={{ marginTop: 24 }}>
-        <button
-          onClick={downloadReport}
-          className="btn-outline-gold"
-          style={{ width: "100%" }}
-        >
+        <button onClick={downloadReport} className="btn-outline-gold" style={{ width: "100%" }}>
           Download Report
         </button>
       </div>
