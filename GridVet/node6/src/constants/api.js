@@ -12,23 +12,23 @@ export const API = {
   // POST — body: { agent_name: string, agent_endpoint: string }
 
   RUN_TEST: `${BASE_URL}/run-test`,
-  // POST — no body — triggers the full pipeline
+  // POST — body: { tier: string, mode: string, session_id: string }
 
-  STOP_TEST: `${BASE_URL}/stop-test`,
-  // POST — no body — halts the current run
+  STOP_TEST: (id) => `${BASE_URL}/stop-test/${id}`,
+  // POST — no body — halts the current run for the specific session
 
-  REPORT: `${BASE_URL}/report`,
-  // GET  — returns ResultEngine.get_full_report() JSON
+  REPORT: (id) => `${BASE_URL}/report/${id}`,
+  // GET  — returns ResultEngine.get_full_report() JSON for the session
 
-  STREAM: `${BASE_URL}/stream`,
-  // GET (SSE) — streams one JSON event per packet result
-  // Connect with: new EventSource(API.STREAM)
+  STREAM: (id) => `${BASE_URL}/stream/${id}`,
+  // GET (SSE) — streams one JSON event per packet result for the session
+  // Connect with: new EventSource(API.STREAM(sessionId))
 
   TEST_HISTORY: `${BASE_URL}/test-history`,
   // GET  — returns list of past test run summaries
 
-  STATUS: `${BASE_URL}/status`,
-  // GET  — lightweight test-run status probe
+  STATUS: (id) => `${BASE_URL}/status/${id}`,
+  // GET  — lightweight test-run status probe for the session
 
   GENERATE_REPORT_CARD: `${BASE_URL}/generate-report-card`,
   // POST — body: { report: object, agent_name: string }
