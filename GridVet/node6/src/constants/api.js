@@ -4,7 +4,7 @@
 // All endpoints are defined here. Do not hardcode URLs elsewhere.
 // ================================================================
 
-export const BASE_URL = "VITE_API_URL";
+export const BASE_URL = import.meta.env.VITE_API_URL;
 // ↑ REPLACE THIS with your Render deployment URL before going live
 
 export const API = {
