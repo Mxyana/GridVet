@@ -67,25 +67,13 @@ function tierLabelColor(tier) {
   if (t === "S") return "#ffd700";
   if (t === "A") return "#d1d5db";
   if (t === "B") return "#60a5fa";
-  return "var(--red)"; 
+  return "var(--red)";
 }
 
 const TEST_TIERS = [
-  {
-    key: "Quick",
-    packets: 10,
-    description: "Fast debugging — 10 packets for rapid iteration.",
-  },
-  {
-    key: "Standard",
-    packets: 30,
-    description: "Balanced assessment — 30 packets for reliable scoring.",
-  },
-  {
-    key: "Comprehensive",
-    packets: 50,
-    description: "Final gauntlet — 50 packets for full coverage.",
-  },
+  { key: "Quick", packets: 10, description: "Fast debugging — 10 packets for rapid iteration." },
+  { key: "Standard", packets: 30, description: "Balanced assessment — 30 packets for reliable scoring." },
+  { key: "Comprehensive", packets: 50, description: "Final gauntlet — 50 packets for full coverage." },
 ];
 
 const TEST_MODES = [
@@ -98,14 +86,14 @@ export default function Home() {
 
   const [agentName, setAgentName] = useState("");
   const [agentEndpoint, setAgentEndpoint] = useState("");
-  const [regStatus, setRegStatus] = useState(null); 
+  const [regStatus, setRegStatus] = useState(null);
   const [registering, setRegistering] = useState(false);
   const [starting, setStarting] = useState(false);
 
-  const [history, setHistory] = useState(null); 
+  const [history, setHistory] = useState(null);
   const [historyError, setHistoryError] = useState(false);
 
-  const [testStatus, setTestStatus] = useState("IDLE"); 
+  const [testStatus, setTestStatus] = useState("IDLE");
   const [reportData, setReportData] = useState(null);
   const [narrative, setNarrative] = useState("");
   const [cardLoading, setCardLoading] = useState(false);
@@ -115,6 +103,12 @@ export default function Home() {
   const [selectedMode, setSelectedMode] = useState("Practice");
 
   const pollRef = useRef(null);
+
+  // FIX (#3): keep latest agentName accessible from interval callback to avoid stale closure
+  const agentNameRef = useRef(agentName);
+  useEffect(() => {
+    agentNameRef.current = agentName;
+  }, [agentName]);
 
   useEffect(() => {
     try {
@@ -148,15 +142,15 @@ export default function Home() {
     };
   }, []);
 
-  useEffect(() => {
-    let stopped = false;
-    let lastTriggeredFor = null; 
+  // FIX (#2): polling extracted so it can be (re)started on every Start Test click
+  const startPolling = React.useCallback(() => {
+    if (pollRef.current) return; // already polling
+
+    let lastTriggeredFor = null;
 
     pollRef.current = setInterval(async () => {
-      if (stopped) return;
-      
       const sessionId = sessionStorage.getItem("gridvet_session_id");
-      if (!sessionId) return; // Skip polling if no active session ID exists
+      if (!sessionId) return;
 
       try {
         const res = await fetch(API.STATUS(sessionId));
@@ -182,18 +176,23 @@ export default function Home() {
           }
         }
       } catch (err) {
-        // Transient network errors are fine — the next tick will retry.
+        // Transient network errors — the next tick will retry.
       }
     }, 3000);
+  }, []);
 
+  // Start polling on mount in case a test was already in flight (e.g. page refresh)
+  useEffect(() => {
+    if (sessionStorage.getItem("gridvet_session_id")) {
+      startPolling();
+    }
     return () => {
-      stopped = true;
       if (pollRef.current) {
         clearInterval(pollRef.current);
         pollRef.current = null;
       }
     };
-  }, []);
+  }, [startPolling]);
 
   async function fetchReportAndGenerate(sessionId) {
     if (!sessionId) {
@@ -213,7 +212,8 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           report: report,
-          agent_name: agentName || "Agent",
+          // FIX (#3): read latest agent name from ref
+          agent_name: agentNameRef.current || "Agent",
         }),
       });
       const cardData = await cardRes.json();
@@ -262,9 +262,9 @@ export default function Home() {
         }),
       });
       if (!res.ok) throw new Error("register failed");
-      
+
       const data = await res.json();
-      
+
       try {
         sessionStorage.setItem("gridvet_agent_name", agentName);
         sessionStorage.setItem("gridvet_agent_endpoint", agentEndpoint);
@@ -272,7 +272,7 @@ export default function Home() {
           sessionStorage.setItem("gridvet_session_id", data.session_id);
         }
       } catch {}
-      
+
       setRegStatus({ ok: true, message: `Agent registered: ${agentName}` });
     } catch (e) {
       setRegStatus({
@@ -290,28 +290,32 @@ export default function Home() {
       alert("No active session found. Please register your agent first.");
       return;
     }
-    
+
     setStarting(true);
     setReportData(null);
     setNarrative("");
     setCardError("");
-    
+
     try {
-      await fetch(API.RUN_TEST, {
+      const res = await fetch(API.RUN_TEST, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           tier: selectedTier,
           mode: selectedMode,
-          session_id: sessionId
+          session_id: sessionId,
         }),
       });
+      // FIX (#4): don't claim RUNNING on a failed request
+      if (!res.ok) throw new Error("run failed");
       setTestStatus("RUNNING");
+      startPolling(); // FIX (#2): re-arm polling for this run
+      navigate("/live");
     } catch (e) {
-      setTestStatus("RUNNING");
+      console.error("Failed to start test:", e);
+      setCardError("Failed to start test. Please try again.");
     } finally {
       setStarting(false);
-      navigate("/live");
     }
   };
 
@@ -655,7 +659,8 @@ function renderRecentTests({ history, historyError }) {
 
       {history === null && (
         <div>
-          {map((i) => (
+          {/* FIX (#1): provide an array to .map */}
+          {[0, 1, 2].map((i) => (
             <div
               key={i}
               className="pulse-bar"
@@ -701,31 +706,13 @@ function renderRecentTests({ history, historyError }) {
                 borderRadius: 6,
               }}
             >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 12,
-                }}
-              >
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
                 <TierBadge tier={row.tier || "C"} size="sm" />
                 <div>
-                  <div
-                    style={{
-                      color: "var(--text-primary)",
-                      fontSize: 13,
-                      fontWeight: 500,
-                    }}
-                  >
+                  <div style={{ color: "var(--text-primary)", fontSize: 13, fontWeight: 500 }}>
                     {row.agent_name || "Unknown agent"}
                   </div>
-                  <div
-                    style={{
-                      color: "var(--text-muted)",
-                      fontSize: 11,
-                      marginTop: 2,
-                    }}
-                  >
+                  <div style={{ color: "var(--text-muted)", fontSize: 11, marginTop: 2 }}>
                     {row.date || row.timestamp || "—"}
                   </div>
                 </div>
