@@ -23,6 +23,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import requests
+from upstash_redis import Redis
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -84,6 +85,30 @@ logging.basicConfig(
     format="[Main] %(asctime)s — %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Redis (Upstash) — persistent verification ledger
+# Replaces the local records.json file so the ledger survives Render's
+# ephemeral filesystem restarts. Gracefully degrades to None when the
+# credentials are absent (e.g. local dev without a Redis instance) so the
+# rest of the app continues to start normally.
+# ---------------------------------------------------------------------------
+_redis_url = os.getenv("UPSTASH_REDIS_REST_URL")
+_redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+try:
+    if _redis_url and _redis_token:
+        redis_db = Redis(url=_redis_url, token=_redis_token)
+        logger.info("Redis (Upstash) client initialized — ledger is persistent.")
+    else:
+        redis_db = None
+        logger.warning(
+            "UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN not set — "
+            "verification ledger will be unavailable (local dev mode)."
+        )
+except Exception as _redis_exc:
+    redis_db = None
+    logger.warning("Failed to initialize Redis client: %s", _redis_exc)
 
 
 # ---------------------------------------------------------------------------
@@ -218,11 +243,6 @@ def _append_run_history(*, terminal_status: str, tier: str) -> None:
 # ---------------------------------------------------------------------------
 # Verifiable reporting (authorized runs only)
 # ---------------------------------------------------------------------------
-# Path is intentionally local + relative so the audit ledger stays alongside
-# the run. records.json is keyed by report_id; rewriting the whole map on
-# every terminal event is fine for the tens-to-hundreds of entries this
-# tool produces.
-RECORDS_PATH = "records.json"
 
 _BASE62_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
@@ -259,42 +279,6 @@ def build_report_id(bot_name: str, timestamp_ms: int) -> str:
     prefix = (cleaned[:2] or "XX").ljust(2, "X")
     return f"{prefix}_{base62_encode(int(timestamp_ms))}"
 
-
-def save_verification_record(
-    report_id: str,
-    *,
-    bot_name: str,
-    timestamp_ms: int,
-    secure_hash: str,
-    status: str,
-    records_path: str = RECORDS_PATH,
-) -> None:
-    """
-    Insert/replace the verification entry for ``report_id`` in records.json.
-
-    Writes via a temp file + ``os.replace`` so a crash mid-write cannot
-    leave a half-written ledger. A corrupt or missing existing file is
-    treated as empty rather than fatal — the new entry still lands.
-    """
-    try:
-        with open(records_path, "r", encoding="utf-8") as f:
-            records = json.load(f)
-        if not isinstance(records, dict):
-            records = {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        records = {}
-
-    records[report_id] = {
-        "bot_name": bot_name,
-        "timestamp_ms": timestamp_ms,
-        "secure_hash": secure_hash,
-        "status": status,
-    }
-
-    tmp_path = records_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2, sort_keys=True)
-    os.replace(tmp_path, records_path)
 
 
 async def _generate_groq_narrative(report_obj: dict, bot_name: str) -> str:
@@ -471,7 +455,7 @@ def save_report_file(session_key: str, master_report: str) -> str:
     embedded inside ``master_report`` as the ``Audit ID`` line, but is never
     appended again here.  This keeps the on-disk content identical to the
     string that was passed to ``hashlib.sha256``, so the SHA-256 stored in
-    ``records.json`` can be verified against the raw file at any time.
+    the Redis ledger can be verified against the raw file at any time.
 
     Parameters
     ----------
@@ -499,7 +483,7 @@ def save_report_file(session_key: str, master_report: str) -> str:
 async def emit_verification(status: str) -> dict:
     """
     Generate the session_key + SHA-256 for the just-finished run and persist
-    them to ``records.json``. Called from the three terminal points of
+    them to Redis (Upstash). Called from the three terminal points of
     ``run_pipeline`` (COMPLETE / STOPPED / ERROR). Never raises — audit
     logging must not be able to mask the pipeline's real terminal state.
 
@@ -508,7 +492,7 @@ async def emit_verification(status: str) -> dict:
       2. AI Narrative       — await Groq; blocks until fully resolved.
       3. Master Compilation — assemble formatted report string with narrative.
       4. Hash & Archive     — SHA-256 the master string; save {session_key}.txt.
-      5. Ledger Update      — write session_key entry to records.json.
+      5. Ledger Update      — write session_key entry to Redis.
 
     The ``await`` in Step 2 is the race-condition gate: hashing (Step 4)
     cannot begin until the LLM response has been injected into the master
@@ -557,15 +541,30 @@ async def emit_verification(status: str) -> dict:
         save_report_file(session_key, normalized_string)
 
         # ── Step 5: Ledger Update ────────────────────────────────────────────
-        # records.json key  = session_key  (matches filename stem exactly).
-        # Value contains the three V2-spec fields + run status.
-        save_verification_record(
-            session_key,
-            bot_name=bot_name,
-            timestamp_ms=timestamp_ms,
-            secure_hash=secure_hash,
-            status=status,
-        )
+        # Persist to Redis (Upstash) keyed by session_key so the ledger
+        # survives Render's ephemeral filesystem restarts. Falls back
+        # silently if redis_db is None (local dev without credentials).
+        record_data = {
+            "bot_name": bot_name,
+            "timestamp_ms": timestamp_ms,
+            "secure_hash": secure_hash,
+            "status": status,
+        }
+        if redis_db is not None:
+            try:
+                redis_db.set(session_key, json.dumps(record_data))
+                logger.info(
+                    "VERIFICATION — ledger entry saved to Redis: %s", session_key
+                )
+            except Exception as _redis_err:
+                logger.warning(
+                    "Redis write failed for %s: %s", session_key, _redis_err
+                )
+        else:
+            logger.warning(
+                "VERIFICATION — Redis unavailable; ledger entry for %s not persisted.",
+                session_key,
+            )
 
         verification_payload = {
             "report_id": session_key,
@@ -1168,9 +1167,10 @@ async def on_startup() -> None:
 
 # ===========================================================================
 # Verification Portal — isolated endpoint
-# Reuses RECORDS_PATH already defined above and the
-# stdlib hashlib/json/os imports that main.py already pulls in. No existing
-# function, route, or constant is modified.
+# Fetches the ledger entry from Redis (Upstash) using the session_key
+# derived from the uploaded filename. Uses stdlib hashlib/json/os imports
+# already present in main.py. No existing pipeline function or route is
+# modified by this block.
 # ===========================================================================
 from fastapi import UploadFile, File  # safe: re-imports are no-ops
 
@@ -1179,11 +1179,11 @@ from fastapi import UploadFile, File  # safe: re-imports are no-ops
 async def verify_report(file: UploadFile = File(...)) -> dict:
     """
     Verify that an uploaded GridVet report (.txt) matches the SHA-256
-    recorded in records.json at emission time.
+    recorded in the Redis ledger at emission time.
 
     Lookup key: the uploaded filename with a trailing ".txt" stripped.
     That stem is the session_key produced by build_report_id() and is
-    used verbatim as the records.json map key.
+    used verbatim as the Redis key.
 
     Response shape:
         {
@@ -1207,16 +1207,29 @@ async def verify_report(file: UploadFile = File(...)) -> dict:
             "data": {},
         }
 
-    # ---- 2. Load the ledger ----------------------------------------------
-    try:
-        with open(RECORDS_PATH, "r", encoding="utf-8") as f:
-            records = json.load(f)
-        if not isinstance(records, dict):
-            records = {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        records = {}
+    # ---- 2. Load the ledger (Redis) --------------------------------------
+    # Upstash returns stored values as raw strings, so we parse the JSON
+    # back into a dict after retrieval. A None redis_db means the server
+    # started without credentials — fail fast with a clear message rather
+    # than a cryptic 500.
+    if redis_db is None:
+        return {
+            "verified": False,
+            "message": (
+                "Verification ledger is unavailable — Redis not configured on "
+                "this instance. Contact the operator."
+            ),
+            "data": {"session_key": session_key},
+        }
 
-    entry = records.get(session_key)
+    entry = None
+    try:
+        raw = redis_db.get(session_key)
+        if raw is not None:
+            entry = json.loads(raw)
+    except Exception as _redis_err:
+        logger.warning("Redis read failed for %s: %s", session_key, _redis_err)
+
     if entry is None:
         return {
             "verified": False,
@@ -1278,4 +1291,4 @@ async def verify_report(file: UploadFile = File(...)) -> dict:
             "been altered or forged."
         ),
         "data": data_block,
-    }  
+    }
