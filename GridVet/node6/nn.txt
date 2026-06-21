@@ -1,0 +1,31 @@
+1. Idea (Trading Infra)
+The Core Concept: Drawing from active research in Web3 application security, GridVet is a standardized, cryptographic evaluation sandbox for auditing AI trading agents before they are deployed with real capital. It protects against prompt injection, data manipulation, and rogue transactions.
+
+The Pain Point: Developers lack a verifiable way to test a model's resilience against malicious payloads. Furthermore, investors cannot trust self-reported security benchmarks without mathematical proof that the performance results haven't been fabricated.
+ The Solution: GridVet runs targeted injection payloads (currently utilizing historical BTC data) to evaluate an agent's sanity logic under adversarial conditions. To guarantee absolute integrity, GridVet generates a cryptographically hashed `result.txt` file. Our verification portal allows anyone to upload these files; if even a single character has been modified, the forgery is instantly flagged.
+
+2. Progress
+Key Challenges & Solutions: Designing a mathematically secure yet user-friendly proof-of-performance system was our primary hurdle. We engineered a custom pipeline that converts the timestamp of the last fired payload to Base62, combining it with the agent's name for a clean identifier, while the internal content is hashed (SHA-256) to lock in data integrity.
+
+Completed Features:
+
+ Multi-Tier Evaluation Sandbox: "Random Test" (lightweight), "Standard" (capability overview), and "Fixed Benchmark" (rigorous stress test).
+ BTC-Focused Testing: Deployed initial payload structures to evaluate agent performance based strictly on actual BTC data.
+ Cryptographic Proof Portal: Built the result generation engine and validation portal for tamper detection.
+
+Next Steps & Upcoming Features:
+
+ Comprehensive Injection Library: Expanding beyond BTC to allow manual payload selection.
+ Agent Authentication: Ensuring the tested agent belongs to the tester to prevent malicious platform usage.
+ Real-Time Implementation (Long-term): Transitioning GridVet from a sandbox into an active security layer situated between the agent and the model during live execution.
+
+Tech Stack:
+
+ Backend: Python (Nodes 1-6, SHA-256/Hashlib logic).
+ Frontend: React Native.
+ AI/Inference: GroqCloud API & Meta Llama (llama-3.3-70b-versatile). Note: Pivoted from Alibaba Cloud due to payment gateway friction to maintain ultra-low latency parsing.
+ Bitget Integration: [Insert 1-2 sentences here about how this ties into Bitget's Agent Hub or broader infrastructure].
+
+---
+
+How are you currently planning to bridge GridVet into the Bitget tools mentioned in the prompt, or is it designed to be completely platform-agnostic?

@@ -4,6 +4,7 @@ import Sidebar from "./components/Sidebar.jsx";
 import Home from "./pages/Home.jsx";
 import LiveTest from "./pages/LiveTest.jsx";
 import Results from "./pages/Results.jsx";
+import Verify from "./pages/Verify.jsx";
 
 function PageFade({ children }) {
   const location = useLocation();
@@ -27,6 +28,7 @@ function Layout() {
             <Route path="/" element={<Home />} />
             <Route path="/live" element={<LiveTest />} />
             <Route path="/results" element={<Results />} />
+            <Route path="/verify" element={<Verify />} />
           </Routes>
         </PageFade>
       </main>

@@ -33,4 +33,8 @@ export const API = {
   GENERATE_REPORT_CARD: `${BASE_URL}/generate-report-card`,
   // POST — body: { report: object, agent_name: string }
   //        returns { narrative: string, status: "ok" }
+
+  VERIFY: `${BASE_URL}/verify`,
+  // POST — multipart/form-data with a single "file" field (the .txt report)
+  //        returns { verified: bool, message: string, data: {...} }
 };

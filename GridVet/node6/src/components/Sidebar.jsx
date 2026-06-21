@@ -5,6 +5,7 @@ const navItems = [
   { to: "/", label: "Dashboard", end: true },
   { to: "/live", label: "Live Test", end: false },
   { to: "/results", label: "Results", end: false },
+  { to: "/verify", label: "Verify Result", end: false },
 ];
 
 export default function Sidebar() {

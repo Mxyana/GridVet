@@ -207,5 +207,93 @@
     "packets_planned": 10,
     "packets_processed": 10,
     "timestamp": "2026-06-20T12:26:42.046383+00:00"
+  },
+  {
+    "agent_name": "Final_Test_2",
+    "tier_selected": "Quick",
+    "tier": "S",
+    "score": 100.0,
+    "status": "COMPLETE",
+    "is_incomplete": false,
+    "packets_planned": 10,
+    "packets_processed": 10,
+    "timestamp": "2026-06-20T13:53:24.238771+00:00"
+  },
+  {
+    "agent_name": "Final_Test_5",
+    "tier_selected": "Quick",
+    "tier": "D",
+    "score": 0.0,
+    "status": "COMPLETE",
+    "is_incomplete": false,
+    "packets_planned": 10,
+    "packets_processed": 10,
+    "timestamp": "2026-06-20T14:05:13.647609+00:00"
+  },
+  {
+    "agent_name": "Final_Test_5",
+    "tier_selected": "Quick",
+    "tier": "D",
+    "score": 0.0,
+    "status": "COMPLETE",
+    "is_incomplete": false,
+    "packets_planned": 10,
+    "packets_processed": 10,
+    "timestamp": "2026-06-20T14:11:08.327744+00:00"
+  },
+  {
+    "agent_name": "Final_Test_5",
+    "tier_selected": "Quick",
+    "tier": "D",
+    "score": 0.0,
+    "status": "STOPPED",
+    "is_incomplete": true,
+    "packets_planned": 10,
+    "packets_processed": 1,
+    "timestamp": "2026-06-20T14:17:39.883310+00:00"
+  },
+  {
+    "agent_name": "PreTest 1",
+    "tier_selected": "Quick",
+    "tier": "D",
+    "score": 0.0,
+    "status": "COMPLETE",
+    "is_incomplete": true,
+    "packets_planned": 10,
+    "packets_processed": 0,
+    "timestamp": "2026-06-21T01:05:51.536862+00:00"
+  },
+  {
+    "agent_name": "PreTest 2",
+    "tier_selected": "Quick",
+    "tier": "C",
+    "score": 60.0,
+    "status": "COMPLETE",
+    "is_incomplete": false,
+    "packets_planned": 10,
+    "packets_processed": 10,
+    "timestamp": "2026-06-21T01:12:43.450691+00:00"
+  },
+  {
+    "agent_name": "PreTest 3",
+    "tier_selected": "Standard",
+    "tier": "D",
+    "score": 3.3,
+    "status": "STOPPED",
+    "is_incomplete": true,
+    "packets_planned": 30,
+    "packets_processed": 1,
+    "timestamp": "2026-06-21T07:49:47.076835+00:00"
+  },
+  {
+    "agent_name": "PreTest 3",
+    "tier_selected": "Quick",
+    "tier": "C",
+    "score": 50.0,
+    "status": "COMPLETE",
+    "is_incomplete": false,
+    "packets_planned": 10,
+    "packets_processed": 10,
+    "timestamp": "2026-06-21T07:51:52.835747+00:00"
   }
 ]

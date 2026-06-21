@@ -247,61 +247,31 @@ export default function Home() {
   // -------------------------------------------------------------------
   // Pure-frontend download (no backend call)
   // -------------------------------------------------------------------
-  function downloadReport() {
-    if (!reportData || !narrative) return;
+function downloadReport() {
+  const rawMasterText = reportData?.raw_master_text;
+  const sessionKey = reportData?.report_id;
 
-    const agentLabel = agentName || "agent";
-    const score = reportData?.agent_report?.security_score ?? "N/A";
-    const tier = reportData?.agent_report?.advanced_label ?? "N/A";
-    const vuln = reportData?.agent_report?.vulnerability_by_type ?? {};
-    const adv = reportData?.advanced ?? {};
-
-    const isIncomplete = adv.is_incomplete ?? false;
-    const packetsPlanned = adv.packets_planned ?? adv.total_packets_processed ?? "N/A";
-    const packetsProcessed = adv.packets_processed ?? adv.total_packets_processed ?? "N/A";
-
-    const incompleteLines = isIncomplete
-      ? [
-          "",
-          "*** INCOMPLETE TEST ***",
-          `Tested ${packetsProcessed} of ${packetsPlanned} planned attacks — results reflect partial coverage.`,
-          "",
-        ]
-      : [];
-
-    const content = [
-      "AGENTIC SANDBOX — SECURITY REPORT",
-      "===================================",
-      `Agent:     ${agentLabel}`,
-      `Endpoint:  ${agentEndpoint || "N/A"}`,
-      `Date:      ${new Date().toUTCString()}`,
-      ...incompleteLines,
-      `SECURITY SCORE: ${score}%`,
-      `TIER: ${tier}`,
-      "",
-      "VULNERABILITY BREAKDOWN:",
-      ...Object.entries(vuln).map(
-        ([k, v]) => `  ${k.replace(/_/g, " ")}: ${v}`
-      ),
-      "",
-      "AI SECURITY ASSESSMENT:",
-      narrative,
-      "",
-      "ADVANCED METRICS:",
-      `  Packets Planned:     ${packetsPlanned}`,
-      `  Packets Processed:   ${packetsProcessed}`,
-      `  Detection Rate:      ${((adv.detection_rate ?? 0) * 100).toFixed(1)}%`,
-      `  False Positive Rate: ${((adv.false_positive_rate ?? 0) * 100).toFixed(1)}%`,
-    ].join("\n");
-
-    const blob = new Blob([content], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${agentLabel.replace(/\s+/g, "_")}_security_report.txt`;
-    a.click();
-    URL.revokeObjectURL(url);
+  if (!rawMasterText || !sessionKey) {
+    console.error("Missing raw_master_text or report_id");
+    return;
   }
+
+  const blob = new Blob([rawMasterText], {
+    type: "text/plain",
+  });
+
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${sessionKey}.txt`;
+
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+
+  URL.revokeObjectURL(url);
+}
 
   // -------------------------------------------------------------------
   // Registration + start handlers (existing behaviour, lightly augmented)
