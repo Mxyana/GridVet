@@ -132,31 +132,40 @@ export default function LiveTest() {
   const [agentName, setAgentName] = useState("Unknown Agent");
   const [status, setStatus] = useState("IDLE");
   const [stopMsg, setStopMsg] = useState(null);
+  const [sessionId, setSessionId] = useState(null);
 
   useEffect(() => {
-    try {
-      const stored = sessionStorage.getItem("gridvet_agent_name");
-      if (stored) setAgentName(stored);
-    } catch {}
+    const storedName = sessionStorage.getItem("gridvet_agent_name");
+    if (storedName) setAgentName(storedName);
+
+    const storedSession = sessionStorage.getItem("gridvet_session_id");
+    setSessionId(storedSession);
   }, []);
 
   useEffect(() => {
-    let source;
-    let hadAny = false;
-    
-    const sessionId = sessionStorage.getItem("gridvet_session_id");
+    if (sessionId === null) return; // wait until we've read sessionStorage
+
     if (!sessionId) {
       setStatus("ERROR");
-      setStopMsg({ ok: false, message: "No active session ID. Please register again." });
+      setStopMsg({
+        ok: false,
+        message: "No active session ID. Please register again.",
+      });
       return;
     }
 
+    let source;
+    let gotTerminalEvent = false;
+
     try {
-      // Stream is now tied to the isolated session
       source = new EventSource(API.STREAM(sessionId));
-      source.onopen = () => setStatus("RUNNING");
+
+      source.onopen = () =>
+        setStatus((p) =>
+          p === "COMPLETE" || p === "STOPPED" ? p : "RUNNING"
+        );
+
       source.onmessage = (event) => {
-        hadAny = true;
         let parsed = null;
         try {
           parsed = JSON.parse(event.data);
@@ -165,47 +174,60 @@ export default function LiveTest() {
         }
 
         if (parsed && parsed.event === "COMPLETE") {
+          gotTerminalEvent = true;
           setStatus("COMPLETE");
           setStopMsg({
             ok: true,
-            message: "Test complete. Return to Dashboard to view your agent's report card.",
+            message:
+              "Test complete. Return to Dashboard to view your agent's report card.",
           });
-          if (source) source.close();
+          source.close();
           return;
         }
         if (parsed && parsed.event === "STOPPED") {
+          gotTerminalEvent = true;
           setStatus("STOPPED");
           setStopMsg({
             ok: true,
-            message: "Test stopped. Return to Dashboard to view your agent's report card.",
+            message:
+              "Test stopped. Return to Dashboard to view your agent's report card.",
           });
-          if (source) source.close();
+          source.close();
           return;
         }
 
-        setStatus("RUNNING");
+        setStatus((p) =>
+          p === "COMPLETE" || p === "STOPPED" ? p : "RUNNING"
+        );
       };
+
       source.onerror = () => {
-        if (hadAny) {
-          setStatus((prev) =>
-            prev === "COMPLETE" || prev === "STOPPED" ? prev : "COMPLETE"
-          );
-        } else {
-          setStatus("IDLE");
-        }
+        // Don't infer COMPLETE from a transport error — that lies to the user.
+        if (gotTerminalEvent) return;
+        setStatus((p) =>
+          p === "COMPLETE" || p === "STOPPED" ? p : "ERROR"
+        );
+        setStopMsg({
+          ok: false,
+          message: "Stream disconnected. Check backend or retry.",
+        });
       };
     } catch {
-      setStatus("IDLE");
+      setStatus("ERROR");
+      setStopMsg({
+        ok: false,
+        message: "Failed to open event stream.",
+      });
     }
+
     return () => {
       if (source) source.close();
     };
-  }, []);
+  }, [sessionId]);
 
   const handleStop = async () => {
     setStopMsg(null);
-    const sessionId = sessionStorage.getItem("gridvet_session_id");
-    
+
     if (!sessionId) {
       setStopMsg({ ok: false, message: "No session found to stop." });
       return;
@@ -215,7 +237,11 @@ export default function LiveTest() {
       const res = await fetch(API.STOP_TEST(sessionId), { method: "POST" });
       if (!res.ok) throw new Error("stop failed");
       setStatus("STOPPED");
-      setStopMsg({ ok: true, message: "Test stopped. Return to Dashboard to view your agent's report card." });
+      setStopMsg({
+        ok: true,
+        message:
+          "Test stopped. Return to Dashboard to view your agent's report card.",
+      });
     } catch (e) {
       setStopMsg({
         ok: false,
@@ -223,6 +249,8 @@ export default function LiveTest() {
       });
     }
   };
+
+  const noSession = status === "ERROR" && !sessionId;
 
   return (
     <div style={{ maxWidth: 1280, margin: "0 auto" }}>
@@ -261,59 +289,80 @@ export default function LiveTest() {
         <StatusPill status={status} />
       </div>
 
-      <div
-        className="livetest-grid"
-        style={{
-          display: "grid",
-          gridTemplateColumns: "60fr 40fr",
-          gap: 20,
-        }}
-      >
-        <div>
-          <LiveFeed />
+      {noSession ? (
+        <div
+          style={{
+            background: "var(--bg-card)",
+            border: "1px solid var(--border)",
+            borderRadius: 8,
+            padding: 20,
+            color: "var(--red)",
+            fontFamily: "Inter, sans-serif",
+            fontSize: 13,
+          }}
+        >
+          {stopMsg?.message ||
+            "No active session ID. Please register again."}
         </div>
+      ) : (
+        <div
+          className="livetest-grid"
+          style={{
+            display: "grid",
+            gridTemplateColumns: "60fr 40fr",
+            gap: 20,
+          }}
+        >
+          <div>
+            <LiveFeed sessionId={sessionId} />
+          </div>
 
-        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-          <AgentReport status={status} />
+          <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+            <AgentReport status={status} sessionId={sessionId} />
 
-          <div
-            style={{
-              background: "var(--bg-card)",
-              border: "1px solid var(--border)",
-              borderRadius: 8,
-              padding: 20,
-            }}
-          >
             <div
               style={{
-                color: "var(--text-secondary)",
-                fontFamily: "Inter, sans-serif",
-                fontSize: 12,
-                textTransform: "uppercase",
-                letterSpacing: "0.12em",
-                marginBottom: 12,
+                background: "var(--bg-card)",
+                border: "1px solid var(--border)",
+                borderRadius: 8,
+                padding: 20,
               }}
             >
-              Run Controls
-            </div>
-            <button onClick={handleStop} className="btn-stop">
-              Stop Test
-            </button>
-            {stopMsg && (
               <div
                 style={{
-                  marginTop: 12,
-                  fontSize: 12,
-                  color: stopMsg.ok ? "var(--green)" : "var(--red)",
+                  color: "var(--text-secondary)",
                   fontFamily: "Inter, sans-serif",
+                  fontSize: 12,
+                  textTransform: "uppercase",
+                  letterSpacing: "0.12em",
+                  marginBottom: 12,
                 }}
               >
-                {stopMsg.message}
+                Run Controls
               </div>
-            )}
+              <button
+                onClick={handleStop}
+                className="btn-stop"
+                disabled={status === "COMPLETE" || status === "STOPPED"}
+              >
+                Stop Test
+              </button>
+              {stopMsg && (
+                <div
+                  style={{
+                    marginTop: 12,
+                    fontSize: 12,
+                    color: stopMsg.ok ? "var(--green)" : "var(--red)",
+                    fontFamily: "Inter, sans-serif",
+                  }}
+                >
+                  {stopMsg.message}
+                </div>
+              )}
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
       <style>{`
         @media (max-width: 900px) {
