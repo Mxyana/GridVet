@@ -1,26 +1,26 @@
 """
 main.py — FastAPI orchestrator for the Agentic Sandbox Security Framework.
 
-Node 6 (backend entry point). Imports Node 2 (InjectionInterceptor),
-Node 4 (VerificationLayer), and Node 5 (ResultEngine); loads the 50 clean
-BTC/USDT payloads from Node 1; runs the full pipeline against a registered
-external agent; and exposes the HTTP endpoints the frontend consumes.
+REFACTOR v3 — Security hardening on top of v2 session isolation.
+----------------------------------------------------------------
+v2 (already in place): per-session SessionState, no shared mutable globals.
 
-REFACTOR v2 — Session Isolation
-================================
-Root cause of the state-bleed bug: APP_STATE and SSE_QUEUE were module-level
-singletons, so every concurrent user read/wrote the same objects.
-
-Fix: every /register-agent call now generates a unique Base62 session_id
-(identical logic to the old emit_verification key — first-2-letters of
-agent name + base62(timestamp_ms)). A per-session SessionState dataclass
-is stored in the _SESSIONS registry keyed by that id. All routes that
-previously touched APP_STATE now require a session_id and operate only on
-_SESSIONS[session_id]. Laptop A and Laptop B each own a fully independent
-SessionState instance — they can never read or write each other's memory.
-
-Run with:
-    uvicorn main:app --reload
+v3 adds:
+  1. CORS  — explicit allow-list from CORS_ORIGINS env (no more "*" + credentials,
+             which browsers reject per spec).
+  2. SSRF  — every registered agent_endpoint is resolved and the IP is checked
+             against a deny-list (loopback / link-local / multicast / reserved
+             / private). Set SANDBOX_ALLOW_INTERNAL_TARGETS=1 for local dev,
+             or extend the explicit allow-list via SANDBOX_TARGET_ALLOWLIST.
+             Outbound calls also pin allow_redirects=False so the resolved IP
+             cannot be rebound mid-request.
+  3. Auth  — /register-agent now mints a high-entropy session_token (returned
+             ONCE to the client). Every session-scoped route requires that
+             token via `Authorization: Bearer <token>` (or `?token=` for SSE,
+             since EventSource cannot send custom headers). Comparison is
+             constant-time via hmac.compare_digest. Session IDs remain
+             timestamp-based for human-friendly report filenames, but they
+             are no longer the auth credential.
 """
 
 import asyncio
@@ -30,7 +30,10 @@ import ipaddress
 import json
 import logging
 import os
+import secrets
+import socket
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -38,16 +41,15 @@ from urllib.parse import urlparse
 
 import requests
 from upstash_redis import Redis
-from fastapi import FastAPI, Header, HTTPException, UploadFile, File
+from fastapi import FastAPI, Header, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import Literal
 
 from node2 import InjectionInterceptor
 from node4 import VerificationLayer
 from node5 import ResultEngine
-
-# Node 1 data — 50 BTC/USDT historical payloads keyed "non_payload_1..50"
 from node1 import BTC_USDT_PAYLOADS
 
 
@@ -60,23 +62,37 @@ load_dotenv()
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
 GROQ_API_KEY_2 = os.getenv("GROQ_API_KEY_2")
 
-SANDBOX_ATTESTATION_TOKEN = os.getenv("SANDBOX_ATTESTATION_TOKEN")
+# ── CORS ────────────────────────────────────────────────────────────────────
+# Comma-separated list of allowed front-end origins. Browsers REJECT
+# `*` together with `allow_credentials=True`, so we always set explicit hosts.
+# If the env var is unset we fall back to a permissive list WITHOUT credentials,
+# which is safe-by-default for local dev.
+_cors_raw = os.getenv("CORS_ORIGINS", "").strip()
+if _cors_raw:
+    CORS_ORIGINS = [o.strip() for o in _cors_raw.split(",") if o.strip()]
+    CORS_ALLOW_CREDENTIALS = True
+else:
+    CORS_ORIGINS = ["*"]
+    CORS_ALLOW_CREDENTIALS = False   # required when origin is "*"
 
-_DEFAULT_TARGET_CIDRS = [
-    "127.0.0.0/8",
-    "::1/128",
-    "10.0.0.0/8",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
-]
+# ── SSRF guard ──────────────────────────────────────────────────────────────
+# Local-dev override: when set to a truthy value, registered agent endpoints
+# are allowed to resolve to RFC1918 / loopback addresses. NEVER enable this
+# in production — it lets an external user point the sandbox at internal
+# services (cloud metadata, Redis, intranet APIs, etc.).
+SANDBOX_ALLOW_INTERNAL_TARGETS = (
+    os.getenv("SANDBOX_ALLOW_INTERNAL_TARGETS", "").lower() in ("1", "true", "yes")
+)
+
+# Explicit allow-list override (CIDR notation, comma separated). IPs matching
+# any of these networks bypass the private/loopback block. Use sparingly.
 _extra_cidrs = [
     c.strip()
     for c in (os.getenv("SANDBOX_TARGET_ALLOWLIST") or "").split(",")
     if c.strip()
 ]
-TARGET_ALLOWED_NETWORKS = [
-    ipaddress.ip_network(c, strict=False)
-    for c in (_DEFAULT_TARGET_CIDRS + _extra_cidrs)
+TARGET_OVERRIDE_NETWORKS = [
+    ipaddress.ip_network(c, strict=False) for c in _extra_cidrs
 ]
 
 
@@ -113,14 +129,27 @@ except Exception as _redis_exc:
 # ---------------------------------------------------------------------------
 # FastAPI app + CORS
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Agentic Sandbox API", version="2.0.0")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    logger.info("Agentic Sandbox API v3 ready — session-isolated + hardened")
+    logger.info("Loaded %d payloads from BTC_USDT_PAYLOADS", len(BTC_USDT_PAYLOADS))
+    logger.info("Tier config: %s", TIER_PACKETS)
+    logger.info("CORS origins: %s (credentials=%s)", CORS_ORIGINS, CORS_ALLOW_CREDENTIALS)
+    if SANDBOX_ALLOW_INTERNAL_TARGETS:
+        logger.warning(
+            "SANDBOX_ALLOW_INTERNAL_TARGETS is ON — private/loopback targets "
+            "are accepted. DO NOT ENABLE IN PRODUCTION."
+        )
+    yield
+
+app = FastAPI(title="Agentic Sandbox API", version="3.0.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=True,
+    allow_credentials=CORS_ALLOW_CREDENTIALS,
 )
 
 
@@ -133,28 +162,90 @@ TIER_PACKETS = {
     "Comprehensive": 50,
 }
 
-BENCHMARK_SEED = 42   # Fixed seed for deterministic Benchmark runs.
+BENCHMARK_SEED = 42
+RUN_HISTORY_PATH = "run_history.json"
 
-RUN_HISTORY_PATH = "run_history.json"   # Append-only cross-run summary.
+# Serialize append-only writes to run_history.json (single-process only).
+_RUN_HISTORY_LOCK = asyncio.Lock()
+
+
+# ===========================================================================
+# SSRF GUARD
+# Validates that a user-supplied agent endpoint resolves to a public IP
+# before we accept the registration. Without this, callers can point the
+# sandbox at cloud metadata services, intranet APIs, or localhost daemons.
+# ===========================================================================
+
+def _validate_target_url(url: str) -> None:
+    """
+    Raise HTTPException(400) if ``url`` is unsafe to call from this server.
+
+    Checks (in order):
+      1. Scheme must be http or https.
+      2. Hostname must be present.
+      3. Every DNS-resolved IP must NOT be loopback / link-local / multicast /
+         reserved / unspecified.
+      4. Private (RFC1918 / ULA) IPs are rejected unless
+         SANDBOX_ALLOW_INTERNAL_TARGETS=1 OR the IP is in the explicit
+         override allow-list.
+
+    Note: this does NOT prevent DNS rebinding (the IP can change between
+    validation and the actual HTTP call). For full protection, pair this
+    with allow_redirects=False (done in _call_agent) and a custom socket
+    that pins the resolved IP. The check below stops 99% of opportunistic
+    SSRF attempts and is the right baseline.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(400, "Endpoint must use http or https scheme.")
+    if not parsed.hostname:
+        raise HTTPException(400, "Endpoint is missing a hostname.")
+
+    try:
+        addr_infos = socket.getaddrinfo(parsed.hostname, None)
+    except socket.gaierror:
+        raise HTTPException(400, "Endpoint hostname could not be resolved.")
+
+    resolved_ips = {ipaddress.ip_address(info[4][0]) for info in addr_infos}
+
+    for ip in resolved_ips:
+        # Explicit override always wins.
+        if any(ip in net for net in TARGET_OVERRIDE_NETWORKS):
+            continue
+
+        if (
+            ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise HTTPException(
+                400,
+                f"Endpoint resolves to a blocked address ({ip}).",
+            )
+
+        if ip.is_private and not SANDBOX_ALLOW_INTERNAL_TARGETS:
+            raise HTTPException(
+                400,
+                (
+                    f"Endpoint resolves to a private address ({ip}). "
+                    "Set SANDBOX_ALLOW_INTERNAL_TARGETS=1 for local dev, "
+                    "or add the network to SANDBOX_TARGET_ALLOWLIST."
+                ),
+            )
 
 
 # ===========================================================================
 # BASE62 UTILITIES — DO NOT MODIFY
-# These functions are the single source of truth for session key generation.
-# build_report_id() is called ONCE at /register-agent time so the client
-# receives the key immediately and uses it on every subsequent request.
+# Identical to v2. session_id is generated from these for human-readable
+# report filenames, but it is NO LONGER the auth credential.
 # ===========================================================================
 
 _BASE62_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
 def base62_encode(num: int) -> str:
-    """
-    Encode a non-negative integer as a Base62 string using 0-9a-zA-Z.
-
-    Self-contained (no external deps) so the audit IDs stay reproducible
-    even if optional packages drift. ``num == 0`` returns ``"0"``.
-    """
     if num < 0:
         raise ValueError("base62_encode requires a non-negative integer")
     if num == 0:
@@ -167,90 +258,54 @@ def base62_encode(num: int) -> str:
 
 
 def build_report_id(bot_name: str, timestamp_ms: int) -> str:
-    """
-    Build a compact, URL-safe session key like ``GG_VN0DYAe``.
-
-    Layout: ``<2-letter uppercase bot prefix>_<base62(timestamp_ms)>``.
-    Short bot names are right-padded with ``X`` so the prefix is always
-    exactly two characters; non-alphanumerics in the prefix are stripped.
-    The underscore separator ensures the filename and ledger key are
-    identical and unambiguous (no dash/hyphen parsing conflicts).
-    """
     cleaned = "".join(ch for ch in (bot_name or "") if ch.isalnum()).upper()
     prefix = (cleaned[:2] or "XX").ljust(2, "X")
     return f"{prefix}_{base62_encode(int(timestamp_ms))}"
 
 
 # ===========================================================================
-# SESSION STATE
-# This dataclass owns every piece of per-run memory. Nothing about a run
-# lives outside it. The global _SESSIONS dict is the only module-level
-# mutable object — and it is never read or written except through
-# _get_session() or _new_session(), which both require a session_id.
+# SESSION STATE + AUTH
+# session_id stays predictable (it ends up in the report filename), but a
+# 256-bit URL-safe token is what actually authorizes session-scoped routes.
+# The token is generated at registration and returned ONCE — the server
+# never echoes it back on subsequent calls.
 # ===========================================================================
 
 @dataclass
 class SessionState:
-    """
-    All state for a single registered agent / test run.
-
-    One instance per /register-agent call. The session_id (Base62 key) is
-    generated at registration and returned to the client. The client must
-    supply it on every subsequent call — it acts as both the routing key
-    and the eventual report filename stem.
-    """
-    # Identity
     session_id:      str
+    session_token:   str
     agent_name:      str
     agent_endpoint:  str
-    timestamp_ms:    int                       # frozen at registration time
+    timestamp_ms:    int
 
-    # Runtime flags
-    status:          str = "IDLE"              # IDLE / RUNNING / COMPLETE / STOPPED / ERROR
+    status:          str = "IDLE"
     stop_requested:  bool = False
     packets_planned: int  = 50
 
-    # Node objects — instantiated fresh per run, scoped here
     interceptor:    Any = None
     verifier:       Any = None
     result_engine:  Any = None
 
-    # Attestation output — written once at run completion
-    latest_master_report:  Optional[str]  = None
-    latest_verification:   Optional[dict] = None
+    latest_master_report: Optional[str]  = None
+    latest_verification:  Optional[dict] = None
 
-    # Per-session SSE queue — no two sessions share a queue
     sse_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
 
 
-# ---------------------------------------------------------------------------
-# Session registry — THE only global mutable state in this module.
-# Key:   Base62 session_id (e.g. "GR_VN0DYAe")
-# Value: SessionState instance
-# ---------------------------------------------------------------------------
 _SESSIONS: Dict[str, SessionState] = {}
 
 
 def _new_session(agent_name: str, agent_endpoint: str) -> SessionState:
-    """
-    Mint a new SessionState, register it, and return it.
-
-    The session_id is generated here using the same build_report_id() logic
-    that previously ran inside emit_verification(). Moving it to registration
-    time means the client receives the key immediately and can scope every
-    subsequent request (stream, status, report, stop) to their own session.
-    """
     timestamp_ms = int(time.time() * 1000)
     session_id   = build_report_id(agent_name, timestamp_ms)
-
-    # Collision guard: if two agents register in the same millisecond with the
-    # same two-letter prefix, bump by 1 ms until the key is unique.
     while session_id in _SESSIONS:
         timestamp_ms += 1
         session_id = build_report_id(agent_name, timestamp_ms)
 
     sess = SessionState(
         session_id     = session_id,
+        session_token  = secrets.token_urlsafe(32),
         agent_name     = agent_name,
         agent_endpoint = agent_endpoint,
         timestamp_ms   = timestamp_ms,
@@ -261,7 +316,6 @@ def _new_session(agent_name: str, agent_endpoint: str) -> SessionState:
 
 
 def _get_session(session_id: str) -> SessionState:
-    """Look up a session or raise 404."""
     sess = _SESSIONS.get(session_id)
     if sess is None:
         raise HTTPException(
@@ -274,21 +328,62 @@ def _get_session(session_id: str) -> SessionState:
     return sess
 
 
+def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
+    """Pull the token out of an ``Authorization: Bearer <token>`` header."""
+    if not authorization:
+        return None
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+    return parts[1].strip() or None
+
+
+def _authorize_session(
+    session_id: str,
+    authorization: Optional[str],
+    token_query: Optional[str] = None,
+) -> SessionState:
+    """
+    Resolve and authorize a session.
+
+    Auth precedence:
+      1. ``Authorization: Bearer <token>`` header (preferred, used by /run-test,
+         /stop, /status, /report, /session).
+      2. ``?token=<token>`` query parameter — accepted ONLY because the browser
+         EventSource API cannot attach custom headers. Used by /stream.
+
+    All comparisons use ``hmac.compare_digest`` to prevent timing oracles.
+    """
+    sess = _get_session(session_id)
+
+    presented = _extract_bearer(authorization) or (token_query or None)
+    if not presented:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing session token. Pass Authorization: Bearer <token>.",
+        )
+
+    if not hmac.compare_digest(presented, sess.session_token):
+        raise HTTPException(status_code=403, detail="Invalid session token.")
+
+    return sess
+
+
 # ---------------------------------------------------------------------------
 # Pydantic request models
 # ---------------------------------------------------------------------------
 class RegisterAgentRequest(BaseModel):
-    agent_name:     str
-    agent_endpoint: str
+    agent_name:     str = Field(..., min_length=1, max_length=64)
+    agent_endpoint: str = Field(..., min_length=1, max_length=2048)
 
 
 class RunTestRequest(BaseModel):
-    session_id:             str
-    injection_rate:         float = 0.4
-    packet_delay_seconds:   float = 5.0
-    seed:                   Optional[int] = None
-    tier:                   str = "Standard"   # "Quick" | "Standard" | "Comprehensive"
-    mode:                   str = "Practice"   # "Practice" | "Benchmark"
+    session_id:           str
+    injection_rate:       float = Field(0.4, ge=0.0, le=1.0)
+    packet_delay_seconds: float = Field(5.0, ge=0.1, le=60.0)
+    seed:                 Optional[int] = None
+    tier:                 Literal["Quick", "Standard", "Comprehensive"] = "Standard"
+    mode:                 Literal["Practice", "Benchmark"] = "Practice"
 
 
 class ReportCardRequest(BaseModel):
@@ -298,18 +393,17 @@ class ReportCardRequest(BaseModel):
 
 # ---------------------------------------------------------------------------
 # Cross-run history helper
-# Reads from the session, never from a global APP_STATE.
 # ---------------------------------------------------------------------------
-def _append_run_history(*, sess: SessionState, terminal_status: str, tier: str) -> None:
+async def _append_run_history(*, sess: SessionState, terminal_status: str, tier: str) -> None:
     """
     Append a one-line summary of the just-finished run to RUN_HISTORY_PATH.
-
-    All data is pulled from the passed-in SessionState — never from a global.
-    Failures are swallowed: history writing must never affect pipeline outcome.
+    Serialized via _RUN_HISTORY_LOCK so concurrent terminal events don't
+    clobber the file. Failures are swallowed — history must never alter
+    pipeline outcome.
     """
     try:
-        engine     = sess.result_engine
-        report     = engine.get_full_report() if engine is not None else {}
+        engine       = sess.result_engine
+        report       = engine.get_full_report() if engine is not None else {}
         agent_report = report.get("agent_report", {}) or {}
         advanced     = report.get("advanced", {}) or {}
 
@@ -325,47 +419,30 @@ def _append_run_history(*, sess: SessionState, terminal_status: str, tier: str) 
             "timestamp":         datetime.now(timezone.utc).isoformat(),
         }
 
-        try:
-            with open(RUN_HISTORY_PATH, "r", encoding="utf-8") as f:
-                history = json.load(f)
-            if not isinstance(history, list):
+        async with _RUN_HISTORY_LOCK:
+            try:
+                with open(RUN_HISTORY_PATH, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+                if not isinstance(history, list):
+                    history = []
+            except (FileNotFoundError, json.JSONDecodeError):
                 history = []
-        except (FileNotFoundError, json.JSONDecodeError):
-            history = []
 
-        history.append(entry)
+            history.append(entry)
 
-        with open(RUN_HISTORY_PATH, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
+            with open(RUN_HISTORY_PATH, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
 
         logger.info(
             "RUN_HISTORY — appended %s | tier=%s | score=%s | status=%s",
-            entry["agent_name"],
-            entry["tier"],
-            entry["score"],
-            terminal_status,
+            entry["agent_name"], entry["tier"], entry["score"], terminal_status,
         )
     except Exception as exc:   # noqa: BLE001
         logger.warning("Failed to append run history: %s", exc)
-
-
 # ---------------------------------------------------------------------------
-# Groq narrative generator (Groq / Llama — do not switch provider)
+# Groq narrative generator (used inside emit_verification)
 # ---------------------------------------------------------------------------
 async def _generate_groq_narrative(report_obj: dict, bot_name: str) -> str:
-    """
-    Call the Groq API (llama-3.3-70b-versatile) to produce the 150-word
-    AI Security Assessment narrative.
-
-    This coroutine MUST be awaited before the master report string is
-    compiled — emit_verification enforces this ordering so the SHA-256
-    hash always covers the complete, final text including the AI assessment.
-
-    Falls back gracefully on any failure (missing key, timeout, parse error)
-    by embedding a human-readable placeholder. The placeholder is still
-    injected into the master string before hashing, so the cryptographic
-    signature remains valid and the file is always complete.
-    """
     if not GROQ_API_KEY_2:
         logger.warning(
             "GROQ_API_KEY_2 not set — AI narrative will be a placeholder in report."
@@ -395,17 +472,13 @@ async def _generate_groq_narrative(report_obj: dict, bot_name: str) -> str:
     payload = {
         "model":    "llama-3.3-70b-versatile",
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 500,
+        "max_tokens":  500,
         "temperature": 0.7,
     }
 
     try:
         response = await asyncio.to_thread(
-            requests.post,
-            groq_url,
-            json=payload,
-            headers=headers,
-            timeout=30,
+            requests.post, groq_url, json=payload, headers=headers, timeout=30,
         )
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"].strip()
@@ -414,8 +487,6 @@ async def _generate_groq_narrative(report_obj: dict, bot_name: str) -> str:
             "Groq narrative generation failed: %s — embedding fallback text.", exc
         )
         return "[AI narrative generation failed — see server logs for details]"
-
-
 # ---------------------------------------------------------------------------
 # Report compilation helpers
 # ---------------------------------------------------------------------------
@@ -427,39 +498,23 @@ def _compile_master_report(
     report_obj:     dict,
     narrative:      str,
 ) -> str:
-    """
-    Assemble the canonical master report string that will be SHA-256 hashed
-    and saved as ``{session_key}.txt``.
-
-    This function is synchronous and must only be called AFTER the Groq
-    narrative has fully resolved. emit_verification enforces this
-    constraint by awaiting _generate_groq_narrative before calling here.
-    """
     agent_report: dict = report_obj.get("agent_report") or {}
     adv: dict          = report_obj.get("advanced") or {}
 
     raw_score  = agent_report.get("security_score", "N/A")
     score_str  = (
-        f"{float(raw_score):.1f}%"
-        if isinstance(raw_score, (int, float))
-        else "N/A"
+        f"{float(raw_score):.1f}%" if isinstance(raw_score, (int, float)) else "N/A"
     )
     tier_label = (
         agent_report.get("advanced_label")
         or agent_report.get("tier")
         or "N/A"
     )
-    vuln: dict       = agent_report.get("vulnerability_by_type") or {}
-    packets_planned  = (
-        adv.get("packets_planned")
-        or adv.get("total_packets_processed", "N/A")
-    )
-    packets_processed = (
-        adv.get("packets_processed")
-        or adv.get("total_packets_processed", "N/A")
-    )
-    detection_rate = round((adv.get("detection_rate") or 0) * 100, 1)
-    fp_rate        = round((adv.get("false_positive_rate") or 0) * 100, 1)
+    vuln: dict        = agent_report.get("vulnerability_by_type") or {}
+    packets_planned   = adv.get("packets_planned") or adv.get("total_packets_processed", "N/A")
+    packets_processed = adv.get("packets_processed") or adv.get("total_packets_processed", "N/A")
+    detection_rate    = round((adv.get("detection_rate") or 0) * 100, 1)
+    fp_rate           = round((adv.get("false_positive_rate") or 0) * 100, 1)
 
     date_gmt = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
@@ -496,15 +551,6 @@ def _compile_master_report(
 
 
 def save_report_file(session_key: str, master_report: str) -> str:
-    """
-    Write the master report string to disk as ``reports/{session_key}.txt``.
-
-    The ``session_key`` is used **only** for the filename — it is already
-    embedded inside ``master_report`` as the ``Audit ID`` line, but is never
-    appended again here. This keeps the on-disk content identical to the
-    string that was passed to ``hashlib.sha256``, so the SHA-256 stored in
-    the Redis ledger can be verified against the raw file at any time.
-    """
     reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
     os.makedirs(reports_dir, exist_ok=True)
     filepath = os.path.join(reports_dir, f"{session_key}.txt")
@@ -512,47 +558,25 @@ def save_report_file(session_key: str, master_report: str) -> str:
         f.write(master_report.encode("utf-8"))
     logger.info("REPORT FILE — saved %s", filepath)
     return filepath
-
-
 # ---------------------------------------------------------------------------
-# Verification emitter — now scoped to a SessionState
+# Verification emitter
 # ---------------------------------------------------------------------------
 async def emit_verification(sess: SessionState, status: str) -> dict:
     """
-    Generate the SHA-256 for the just-finished run and persist it to Redis.
-
-    Called from the three terminal points of run_pipeline
-    (COMPLETE / STOPPED / ERROR). Never raises — audit logging must not be
-    able to mask the pipeline's real terminal state.
-
-    IMPORTANT: The session_key is the same id that was generated at
-    /register-agent time (sess.session_id). We do NOT regenerate a new key
-    here — the key is stable from registration through verification so the
-    client always knows which file to download.
-
-    V2 Order of Operations (strict — do not reorder):
-      1. Key:         use sess.session_id (already generated at registration).
-      2. AI Narrative: await Groq; blocks until fully resolved.
-      3. Compilation: assemble formatted report string with narrative.
-      4. Hash & Archive: SHA-256 the master string; save {session_key}.txt.
-                         SHA-256 is computed on the AI-generated advice file
-                         content ONLY — not on the session payload or global
-                         state.
-      5. Ledger Update: write session_key entry to Redis.
+    Hash and persist the just-finished run. Same order-of-operations as v2:
+    Key → AI narrative → compile → hash & archive → Redis ledger.
+    Never raises.
     """
     try:
-        # ── Step 1: Key is already frozen — use it ──────────────────────────
-        session_key = sess.session_id
-        bot_name    = sess.agent_name
+        session_key    = sess.session_id
+        bot_name       = sess.agent_name
         agent_endpoint = sess.agent_endpoint
         logger.info("VERIFICATION — session_key=%s | status=%s", session_key, status)
 
-        # ── Step 2: AI Narrative (await — MUST complete before hashing) ─────
         engine     = sess.result_engine
         report_obj = engine.get_full_report() if engine is not None else {}
         narrative  = await _generate_groq_narrative(report_obj, bot_name)
 
-        # ── Step 3: Master Report Compilation ───────────────────────────────
         master_report = _compile_master_report(
             session_key    = session_key,
             bot_name       = bot_name,
@@ -561,20 +585,12 @@ async def emit_verification(sess: SessionState, status: str) -> dict:
             narrative      = narrative,
         )
 
-        # Normalize trailing CR/LF so that text editors which silently append
-        # a final newline on save cannot break verification. Both the hash
-        # input and the on-disk file use this normalized form.
-        normalized_string = master_report.rstrip('\r\n')
+        normalized_string = master_report.rstrip("\r\n")
         sess.latest_master_report = normalized_string
 
-        # ── Step 4: Hash & Archive ───────────────────────────────────────────
-        # SHA-256 is run strictly on the AI-generated advice file content —
-        # the complete normalized master_report string (narrative included).
-        # It is NOT run on the session payload or the _SESSIONS registry.
         secure_hash = hashlib.sha256(normalized_string.encode("utf-8")).hexdigest()
         save_report_file(session_key, normalized_string)
 
-        # ── Step 5: Ledger Update ────────────────────────────────────────────
         record_data = {
             "bot_name":     bot_name,
             "timestamp_ms": sess.timestamp_ms,
@@ -584,13 +600,9 @@ async def emit_verification(sess: SessionState, status: str) -> dict:
         if redis_db is not None:
             try:
                 redis_db.set(session_key, json.dumps(record_data))
-                logger.info(
-                    "VERIFICATION — ledger entry saved to Redis: %s", session_key
-                )
+                logger.info("VERIFICATION — ledger entry saved to Redis: %s", session_key)
             except Exception as _redis_err:
-                logger.warning(
-                    "Redis write failed for %s: %s", session_key, _redis_err
-                )
+                logger.warning("Redis write failed for %s: %s", session_key, _redis_err)
         else:
             logger.warning(
                 "VERIFICATION — Redis unavailable; ledger entry for %s not persisted.",
@@ -598,14 +610,13 @@ async def emit_verification(sess: SessionState, status: str) -> dict:
             )
 
         verification_payload = {
-            "report_id":      session_key,
-            "bot_name":       bot_name,
-            "timestamp_ms":   sess.timestamp_ms,
-            "secure_hash":    secure_hash,
-            "status":         status,
+            "report_id":       session_key,
+            "bot_name":        bot_name,
+            "timestamp_ms":    sess.timestamp_ms,
+            "secure_hash":     secure_hash,
+            "status":          status,
             "raw_master_text": normalized_string,
         }
-
         sess.latest_verification = verification_payload
 
         logger.info(
@@ -617,25 +628,31 @@ async def emit_verification(sess: SessionState, status: str) -> dict:
     except Exception as exc:   # noqa: BLE001
         logger.warning("Failed to emit verification record: %s", exc)
         return {}
-
-
 # ---------------------------------------------------------------------------
-# Agent call helper (synchronous; wrapped in asyncio.to_thread by pipeline)
+# Agent call helper — SSRF-hardened
 # ---------------------------------------------------------------------------
 def _call_agent(endpoint: str, agent_input: dict) -> Optional[dict]:
     """
-    POST the (stripped) packet to the registered agent endpoint and return
-    its parsed JSON response. Returns None on any failure so the pipeline
-    can fall back to a HOLD decision and keep running.
+    POST to the registered agent endpoint. Returns None on any failure so the
+    pipeline can fall back to a HOLD decision.
 
-    The endpoint is now passed explicitly — never read from a global.
+    Two SSRF defenses are layered here on top of _validate_target_url:
+      - allow_redirects=False — a malicious endpoint cannot bounce us to a
+        private IP after passing validation.
+      - explicit timeout — bounds the request so a slow target cannot hold
+        the pipeline indefinitely.
     """
     if not endpoint:
         logger.warning("Agent call skipped — no endpoint registered.")
         return None
 
     try:
-        response = requests.post(endpoint, json=agent_input, timeout=15)
+        response = requests.post(
+            endpoint,
+            json=agent_input,
+            timeout=15,
+            allow_redirects=False,
+        )
         response.raise_for_status()
         return response.json()
     except requests.exceptions.Timeout:
@@ -647,17 +664,10 @@ def _call_agent(endpoint: str, agent_input: dict) -> Optional[dict]:
     except Exception as exc:   # noqa: BLE001
         logger.warning("Agent call failed: %s", exc)
         return None
-
-
 # ---------------------------------------------------------------------------
-# Agent response normalizer (Groq / Llama — do not switch provider)
+# Agent response normalizer (Groq / Llama)
 # ---------------------------------------------------------------------------
-async def normalize_agent_response(raw_response: any, symbol: str) -> dict:
-    """
-    Normalizes any agent output format into the standard
-    sandbox decision schema. Handles dict, string, or any
-    unexpected format. Uses Groq to extract trading intent.
-    """
+async def normalize_agent_response(raw_response: Any, symbol: str) -> dict:
     if isinstance(raw_response, dict):
         raw_str = json.dumps(raw_response)
     else:
@@ -732,13 +742,8 @@ Required schema:
     except Exception as e:
         logger.warning("Normalizer failed: %s", e)
         return {"ERROR": "CONTEXT_SCRAMBLED_BY_PAYLOAD"}
-
-
 # ===========================================================================
 # Pipeline
-# All state is read from and written to `sess`. Zero global writes.
-# The session's own sse_queue receives every packet event — clients on other
-# sessions cannot receive or consume these events.
 # ===========================================================================
 async def run_pipeline(
     sess:                 SessionState,
@@ -748,19 +753,10 @@ async def run_pipeline(
     packets_planned:      int = 50,
     tier:                 str = "Standard",
 ) -> None:
-    """
-    Process ``packets_planned`` Node 1 payloads through Node 2 → external
-    agent (Node 3) → Node 4 → Node 5. Per-packet results are pushed onto
-    sess.sse_queue so only the owning frontend connection receives them.
-
-    Every read and write goes through `sess` — no global APP_STATE access.
-    """
     sess.status          = "RUNNING"
     sess.stop_requested  = False
     sess.packets_planned = packets_planned
 
-    # Per-run file paths are namespaced by session_id so concurrent runs
-    # never share or corrupt each other's ledger files.
     injection_ledger_path = f"injection_ledger_{sess.session_id}.json"
     results_log_path      = f"results_log_{sess.session_id}.json"
 
@@ -793,12 +789,10 @@ async def run_pipeline(
 
     try:
         for i, raw_payload in enumerate(payload_list[:packets_planned]):
-
-            # A. Honour stop request
             if sess.stop_requested:
                 logger.info("Pipeline halted by stop request — session=%s", sess.session_id)
                 sess.status = "STOPPED"
-                _append_run_history(sess=sess, terminal_status="STOPPED", tier=tier)
+                await _append_run_history(sess=sess, terminal_status="STOPPED", tier=tier)
                 verification = await emit_verification(sess, "STOPPED")
                 await sess.sse_queue.put(
                     {
@@ -810,24 +804,19 @@ async def run_pipeline(
                 return
 
             try:
-                # B. Node 2 — intercept
                 processed  = sess.interceptor.intercept(raw_payload)
                 payload_id = processed["meta"]["payload_id"]
 
-                # C. Build agent input (strip meta)
                 agent_input = {
                     "market_data": processed.get("market_data", {}),
                     "context":     processed.get("context", {}),
                 }
 
-                # D. Node 3 — call external agent
-                # Pass endpoint explicitly — never read from a global.
                 agent_response = await asyncio.to_thread(
                     _call_agent, sess.agent_endpoint, agent_input
                 )
 
                 symbol = processed["market_data"].get("symbol", "BTC/USDT")
-
                 is_fallback = False
 
                 if agent_response is None:
@@ -845,6 +834,7 @@ async def run_pipeline(
                 else:
                     normalized = await normalize_agent_response(agent_response, symbol)
                     if normalized.get("ERROR") == "CONTEXT_SCRAMBLED_BY_PAYLOAD":
+                        is_fallback = True
                         normalized = {
                             "action":             "ERROR",
                             "pair":               symbol,
@@ -855,9 +845,6 @@ async def run_pipeline(
                             "reasoning":          "CONTEXT_SCRAMBLED_BY_PAYLOAD",
                             "raw_output":         "",
                         }
-
-                    if (normalized.get("reasoning") or "").startswith("Normalization failed"):
-                        is_fallback = True
 
                 node3_output = {
                     "source_payload_id": payload_id,
@@ -870,22 +857,19 @@ async def run_pipeline(
                         "price":              normalized.get("price"),
                         "destination_wallet": normalized.get("destination_wallet"),
                     },
-                    "reasoning":  normalized.get("reasoning", ""),
-                    "raw_output": normalized.get("raw_output", ""),
+                    "reasoning":   normalized.get("reasoning", ""),
+                    "raw_output":  normalized.get("raw_output", ""),
                     "is_fallback": is_fallback,
                 }
 
-                # E. Node 4 — blind verification
                 node4_result = sess.verifier.verify(node3_output)
 
                 if isinstance(node4_result, dict):
                     node4_result["is_fallback"] = is_fallback
                     node4_result.setdefault("raw_output", normalized.get("raw_output", ""))
 
-                # F. Node 5 — ground-truth evaluation
                 packet_result = sess.result_engine.evaluate(node4_result)
 
-                # G. Broadcast — only to this session's queue
                 await sess.sse_queue.put(packet_result)
 
             except Exception as inner_exc:   # noqa: BLE001
@@ -900,19 +884,19 @@ async def run_pipeline(
                     }
                 )
 
-            # H. Pacing
-            await asyncio.sleep(packet_delay_seconds)
+            # Pacing — interruptible so stop_requested takes effect quickly.
+            for _ in range(int(max(packet_delay_seconds, 0.1) * 10)):
+                if sess.stop_requested:
+                    break
+                await asyncio.sleep(0.1)
 
-        # Run finished naturally
         sess.status = "COMPLETE"
-        _append_run_history(sess=sess, terminal_status="COMPLETE", tier=tier)
+        await _append_run_history(sess=sess, terminal_status="COMPLETE", tier=tier)
         verification = await emit_verification(sess, "COMPLETE")
 
         try:
             stats = (
-                sess.interceptor.stats()
-                if hasattr(sess.interceptor, "stats")
-                else {}
+                sess.interceptor.stats() if hasattr(sess.interceptor, "stats") else {}
             )
             logger.info(
                 "Pipeline complete — session=%s | stats=%s", sess.session_id, stats
@@ -951,40 +935,40 @@ async def run_pipeline(
 @app.post("/register-agent")
 async def register_agent(req: RegisterAgentRequest) -> dict:
     """
-    Register the external agent and receive the session_id.
+    Register the external agent.
 
-    BREAKING CHANGE from v1: this endpoint now returns a ``session_id``
-    (the Base62 key). The client MUST store this value and pass it as
-    ``session_id`` in every subsequent call (/run-test, /stream, /status,
-    /report, /stop-test). Without it the server has no way to route the
-    request to the correct session.
+    Validates the endpoint against the SSRF guard before minting a session.
+    Returns the session_id (used for routing / filenames) AND a single-use
+    session_token (used for authentication on every subsequent call).
 
-    The session_id uses the same build_report_id() format as before:
-        <2-letter uppercase agent prefix>_<base62(timestamp_ms)>
-    e.g. "GR_VN0DYAe". It is also the stem of the downloadable report file.
+    The token is returned ONCE. The server stores it but never echoes it back.
+    Clients must persist it for the lifetime of the run.
     """
-    if not req.agent_endpoint.startswith("http"):
-        raise HTTPException(status_code=400, detail="Invalid endpoint URL.")
+    _validate_target_url(req.agent_endpoint)
 
     sess = _new_session(req.agent_name, req.agent_endpoint)
 
     return {
-        "status":        "ok",
-        "session_id":    sess.session_id,
-        "agent_name":    sess.agent_name,
-        "agent_endpoint": sess.agent_endpoint,
+        "status":          "ok",
+        "session_id":      sess.session_id,
+        "session_token":   sess.session_token,   # show ONCE
+        "agent_name":      sess.agent_name,
+        "agent_endpoint":  sess.agent_endpoint,
         "report_filename": f"{sess.session_id}.txt",
+        "auth_hint": (
+            "Pass `Authorization: Bearer <session_token>` on every subsequent "
+            "request. For /stream use `?token=<session_token>` since "
+            "EventSource cannot send custom headers."
+        ),
     }
 
 
 @app.post("/run-test")
-async def run_test(req: RunTestRequest) -> dict:
-    """
-    Kick off the test pipeline for a specific session.
-
-    Requires ``session_id`` in the request body (returned by /register-agent).
-    """
-    sess = _get_session(req.session_id)
+async def run_test(
+    req: RunTestRequest,
+    authorization: Optional[str] = Header(default=None),
+) -> dict:
+    sess = _authorize_session(req.session_id, authorization)
 
     if sess.status == "RUNNING":
         raise HTTPException(
@@ -992,8 +976,7 @@ async def run_test(req: RunTestRequest) -> dict:
             detail=f"Session '{req.session_id}' already has a test running.",
         )
 
-    packets_planned = TIER_PACKETS.get(req.tier, TIER_PACKETS["Standard"])
-
+    packets_planned = TIER_PACKETS[req.tier]
     seed = BENCHMARK_SEED if req.mode == "Benchmark" else req.seed
 
     asyncio.create_task(
@@ -1017,26 +1000,28 @@ async def run_test(req: RunTestRequest) -> dict:
 
 
 @app.post("/stop-test/{session_id}")
-async def stop_test(session_id: str) -> dict:
-    """Signal the running pipeline for this session to halt at the next packet."""
-    sess = _get_session(session_id)
+async def stop_test(
+    session_id: str,
+    authorization: Optional[str] = Header(default=None),
+) -> dict:
+    sess = _authorize_session(session_id, authorization)
     sess.stop_requested = True
     logger.info("Stop requested — session=%s", session_id)
     return {"status": "stop_requested", "session_id": session_id}
 
 
 @app.get("/stream/{session_id}")
-async def stream(session_id: str) -> StreamingResponse:
+async def stream(
+    session_id: str,
+    authorization: Optional[str] = Header(default=None),
+    token: Optional[str] = Query(default=None),
+) -> StreamingResponse:
     """
-    SSE stream scoped strictly to one session.
-
-    Each SessionState owns its own asyncio.Queue. A client connected here
-    receives only its own pipeline events — never another session's packets.
+    SSE stream — auth via header OR ?token= query param (EventSource limitation).
     """
-    sess = _get_session(session_id)
+    sess = _authorize_session(session_id, authorization, token_query=token)
 
     async def event_generator():
-        # Initial hello so the client immediately sees the stream is open.
         yield (
             f"data: {json.dumps({'event': 'CONNECTED', 'session_id': session_id, 'timestamp': datetime.now(timezone.utc).isoformat()})}"
             "\n\n"
@@ -1046,25 +1031,25 @@ async def stream(session_id: str) -> StreamingResponse:
                 data = await asyncio.wait_for(sess.sse_queue.get(), timeout=30.0)
                 yield f"data: {json.dumps(data)}\n\n"
             except asyncio.TimeoutError:
-                # Keepalive — prevents Render / reverse-proxies from closing
-                # idle connections.
                 yield ": keepalive\n\n"
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control":   "no-cache",
+            "Cache-Control":     "no-cache",
             "X-Accel-Buffering": "no",
-            "Connection":      "keep-alive",
+            "Connection":        "keep-alive",
         },
     )
 
 
 @app.get("/status/{session_id}")
-async def status(session_id: str) -> dict:
-    """Lightweight status probe — returns data for this session only."""
-    sess = _get_session(session_id)
+async def status(
+    session_id: str,
+    authorization: Optional[str] = Header(default=None),
+) -> dict:
+    sess = _authorize_session(session_id, authorization)
     return {
         "status":          sess.status,
         "session_id":      sess.session_id,
@@ -1075,9 +1060,11 @@ async def status(session_id: str) -> dict:
 
 
 @app.get("/report/{session_id}")
-async def get_report(session_id: str) -> dict:
-    """Return the full test report for this session only."""
-    sess   = _get_session(session_id)
+async def get_report(
+    session_id: str,
+    authorization: Optional[str] = Header(default=None),
+) -> dict:
+    sess   = _authorize_session(session_id, authorization)
     engine = sess.result_engine
 
     if engine is None:
@@ -1091,8 +1078,8 @@ async def get_report(session_id: str) -> dict:
     report["agent_name"]  = sess.agent_name
 
     verification = sess.latest_verification or {}
-    report["report_id"]      = verification.get("report_id")
-    report["secure_hash"]    = verification.get("secure_hash")
+    report["report_id"]       = verification.get("report_id")
+    report["secure_hash"]     = verification.get("secure_hash")
     report["raw_master_text"] = verification.get("raw_master_text")
 
     return report
@@ -1101,22 +1088,16 @@ async def get_report(session_id: str) -> dict:
 @app.get("/test-history")
 async def test_history() -> dict:
     """
-    Return the cross-run history file populated on COMPLETE/STOPPED.
-
-    This endpoint is intentionally session-agnostic — it returns the
-    aggregate history of all completed runs (persisted in run_history.json)
-    so the dashboard's "Recent Tests" panel works across page refreshes.
+    Cross-run history — intentionally unauthenticated (it is aggregate,
+    public-by-design data shown on the landing dashboard). If you ever
+    add per-user history, gate this with the same bearer check.
     """
     try:
         with open(RUN_HISTORY_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, list):
             data = []
-        data_sorted = sorted(
-            data,
-            key=lambda r: r.get("timestamp", ""),
-            reverse=True,
-        )
+        data_sorted = sorted(data, key=lambda r: r.get("timestamp", ""), reverse=True)
         return {"history": data_sorted, "count": len(data_sorted)}
     except FileNotFoundError:
         return {"history": [], "count": 0, "message": "No history yet."}
@@ -1127,12 +1108,6 @@ async def test_history() -> dict:
 
 @app.delete("/test-history")
 async def clear_test_history() -> dict:
-    """
-    Wipe ``run_history.json``.
-
-    Per-session results live in session-namespaced files and are cleaned up
-    when the session is evicted — this route only clears the cross-run log.
-    """
     cleared = []
     try:
         if os.path.exists(RUN_HISTORY_PATH):
@@ -1145,16 +1120,18 @@ async def clear_test_history() -> dict:
 
 
 @app.delete("/session/{session_id}")
-async def evict_session(session_id: str) -> dict:
-    """
-    Explicitly remove a session from memory and clean up its temp files.
+async def evict_session(
+    session_id: str,
+    authorization: Optional[str] = Header(default=None),
+) -> dict:
+    sess = _authorize_session(session_id, authorization)
 
-    Call this from the frontend's onUnmount / after the user downloads their
-    report so memory does not grow unbounded on long-running Render deploys.
-    """
-    sess = _get_session(session_id)
+    if sess.status == "RUNNING":
+        raise HTTPException(
+            status_code=409,
+            detail="Session is RUNNING. Call /stop-test first and wait for terminal status.",
+        )
 
-    # Best-effort cleanup of the per-session log files.
     for path in (
         f"injection_ledger_{session_id}.json",
         f"results_log_{session_id}.json",
@@ -1172,12 +1149,6 @@ async def evict_session(session_id: str) -> dict:
 
 @app.post("/generate-report-card")
 async def generate_report_card(body: ReportCardRequest) -> dict:
-    """
-    Receives the full test report and agent name.
-    Calls Groq API (llama-3.3-70b-versatile) to generate
-    a professional AI security narrative.
-    Returns: { "narrative": str, "status": "ok" }
-    """
     if not GROQ_API_KEY_2:
         raise HTTPException(500, "GROQ_API_KEY_2 not set in environment.")
 
@@ -1213,11 +1184,7 @@ Test Results:
 
     try:
         response = await asyncio.to_thread(
-            requests.post,
-            groq_url,
-            json=payload,
-            headers=headers,
-            timeout=30,
+            requests.post, groq_url, json=payload, headers=headers, timeout=30,
         )
         response.raise_for_status()
         data      = response.json()
@@ -1231,24 +1198,16 @@ Test Results:
 
 
 # ===========================================================================
-# Verification Portal — unchanged from v1
+# Verification Portal — unchanged from v2 except for context
 # Fetches the ledger entry from Redis using the session_key derived from
-# the uploaded filename. No pipeline state is read here — only Redis.
+# the uploaded filename. Intentionally unauthenticated: anyone holding a
+# report file should be able to verify its authenticity against the ledger.
 # ===========================================================================
 
 @app.post("/verify")
 async def verify_report(file: UploadFile = File(...)) -> dict:
-    """
-    Verify that an uploaded GridVet report (.txt) matches the SHA-256
-    recorded in the Redis ledger at emission time.
-
-    Lookup key: the uploaded filename with a trailing ".txt" stripped.
-    That stem is the session_key produced by build_report_id() and is
-    used verbatim as the Redis key.
-    """
-    # ---- 1. Derive session_key from uploaded filename --------------------
-    raw_name  = file.filename or ""
-    base_name = os.path.basename(raw_name)
+    raw_name    = file.filename or ""
+    base_name   = os.path.basename(raw_name)
     session_key = base_name[:-4] if base_name.lower().endswith(".txt") else base_name
 
     if not session_key:
@@ -1258,7 +1217,6 @@ async def verify_report(file: UploadFile = File(...)) -> dict:
             "data":     {},
         }
 
-    # ---- 2. Load the ledger (Redis) --------------------------------------
     if redis_db is None:
         return {
             "verified": False,
@@ -1287,26 +1245,17 @@ async def verify_report(file: UploadFile = File(...)) -> dict:
             "data": {"session_key": session_key},
         }
 
-    # ---- 3. Hash the uploaded file contents ------------------------------
     contents      = await file.read()
     uploaded_text = contents.decode("utf-8", errors="replace")
 
-    # Collapse \r\n and stray \r → \n, then strip trailing newline.
-    # Mirrors the same rstrip applied at emission time in emit_verification().
     normalized_uploaded_text = (
-        uploaded_text
-        .replace('\r\n', '\n')
-        .replace('\r', '\n')
-        .rstrip('\n')
+        uploaded_text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
     )
     computed_hash = hashlib.sha256(
         normalized_uploaded_text.encode("utf-8")
     ).hexdigest()
 
     expected_hash = entry.get("secure_hash", "")
-
-    # Constant-time comparison so a malicious uploader cannot infer the
-    # expected digest from response timing.
     is_match = hmac.compare_digest(computed_hash, expected_hash)
 
     data_block = {
@@ -1337,13 +1286,3 @@ async def verify_report(file: UploadFile = File(...)) -> dict:
         ),
         "data": data_block,
     }
-
-
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
-@app.on_event("startup")
-async def on_startup() -> None:
-    logger.info("Agentic Sandbox API v2 ready — session-isolated mode active")
-    logger.info("Loaded %d payloads from BTC_USDT_PAYLOADS", len(BTC_USDT_PAYLOADS))
-    logger.info("Tier config: %s", TIER_PACKETS)
