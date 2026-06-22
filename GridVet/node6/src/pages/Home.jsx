@@ -137,14 +137,6 @@ export default function Home() {
         if (!cancelled) {
           setHistory(Array.isArray(rows) ? rows : []);
         }
-        if (!res.ok) throw new Error("bad response");
-        const data = await res.json();
-        const rows = Array.isArray(data)
-          ? data
-          : Array.isArray(data?.history)
-          ? data.history
-          : [];
-        if (!cancelled) setHistory(rows);
       } catch (e) {
         if (!cancelled) {
           setHistoryError(true);
@@ -173,7 +165,7 @@ export default function Home() {
 
         const data = await getStatus(sessionId);
 
-        const next = data.status;
+        const next = data?.status;
 
         setTestStatus((prev) => (prev !== next ? next : prev));
 
@@ -221,15 +213,15 @@ export default function Home() {
     try {
       const report = await getReport(sessionId);
 setReportData(report);
-      const report = await getReport(sessionId);
-      setReportData(report);
+      
+      
       
       const cardData = await generateReportCard({
   report,
   agent_name: agentNameRef.current || "Agent",
 });
 
-      setNarrative(cardData.narrative || "");
+      setNarrative(cardData?.narrative || "");
     } catch (err) {
       setCardError("Failed to generate report card.");
     } finally {
@@ -238,6 +230,8 @@ setReportData(report);
   }
 
   async function downloadReport() {
+  const sessionId = sessionStorage.getItem("gridvet_session_id");
+  if (!sessionId) { setCardError("No active session."); return; }
   const result = await downloadReportApi(sessionId);
 
 if (result.alreadyDownloaded) {
@@ -257,7 +251,7 @@ if (result.alreadyDownloaded) {
 
   return;
 }
-  const url = `${BASE_URL}/download-report/${sessionId}?token=${encodeURIComponent(token)}`;
+  const url = `${BASE_URL}/download-report/${sessionId}?token=${encodeURIComponent(result.token)}`;
   let res;
   try {
     res = await fetch(url, { credentials: "include" });
@@ -303,9 +297,7 @@ if (result.alreadyDownloaded) {
   agent_name: agentName,
   agent_endpoint: agentEndpoint,
 });
-      if (!res.ok) throw new Error("register failed");
-
-      const data = await res.json();
+      
       if (data.proof_disclaimer) {
   setProofDisclaimer(data.proof_disclaimer);
 }
@@ -350,7 +342,6 @@ if (result.alreadyDownloaded) {
       
 
       // FIX (#4): don't claim RUNNING on a failed request
-      if (!res.ok) throw new Error("run failed");
       setTestStatus("RUNNING");
       startPolling(); // FIX (#2): re-arm polling for this run
       navigate("/live");
