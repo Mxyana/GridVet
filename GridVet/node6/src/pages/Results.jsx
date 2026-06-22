@@ -3,7 +3,7 @@ import { API } from "../constants/api.js";
 import TierBadge from "../components/TierBadge.jsx";
 import VulnerabilityTable from "../components/VulnerabilityTable.jsx";
 import AdvancedMetrics from "../components/AdvancedMetrics.jsx";
-
+import { getReport } from "../constants/api.js";
 const RESULT_COLORS = {
   PASSED: "var(--green)",
   FAILED: "var(--red)",
@@ -51,10 +51,7 @@ export default function Results() {
 
     (async () => {
       try {
-        import { getReport } from "../constants/api.js";
-const data = await getReport(sessionId);   // throws on non-2xx; wrap accordingly
-        if (!res.ok) throw new Error("bad response");
-        const data = await res.json();
+        const data = await getReport(sessionId);
         if (cancelled) return;
         if (!data || (typeof data === "object" && Object.keys(data).length === 0)) {
           setErrorKind(ERR_EMPTY);
@@ -68,7 +65,7 @@ const data = await getReport(sessionId);   // throws on non-2xx; wrap accordingl
         if (!cancelled) setLoading(false);
       }
     })();
-
+    
     return () => {
       cancelled = true;
     };
