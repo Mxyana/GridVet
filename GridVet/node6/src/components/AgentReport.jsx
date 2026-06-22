@@ -24,44 +24,70 @@ function labelColor(label) {
   return "var(--text-secondary)";
 }
 
-export default function AgentReport({ status }) {
+export default function AgentReport({ status, sessionId }) {
   const [report, setReport] = useState(null);
   const [error, setError] = useState(false);
   const intervalRef = useRef(null);
-
-  const fetchReport = async () => {
-    try {
-      // ⚡ BACKEND: GET API.REPORT — fetches live agent report
-      const res = await fetch(API.REPORT);
-      if (!res.ok) throw new Error("bad response");
-      const data = await res.json();
-      setReport(data);
-      setError(false);
-    } catch (e) {
-      setError(true);
-    }
-  };
+  const cancelledRef = useRef(false);
 
   useEffect(() => {
-    fetchReport();
-    intervalRef.current = setInterval(() => {
-      fetchReport();
-    }, 2000);
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+    cancelledRef.current = false;
+
+    const stopPolling = () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
     };
-  }, []);
 
-  useEffect(() => {
-    if (status === "COMPLETE" && intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-      fetchReport(); // one final fetch
+    const fetchReport = async () => {
+      if (!sessionId) return;
+      try {
+        // ⚡ BACKEND: GET API.REPORT(sessionId) — session-scoped agent report
+        const url =
+          typeof API.REPORT === "function"
+            ? API.REPORT(sessionId)
+            : `${API.REPORT}?session_id=${encodeURIComponent(sessionId)}`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error("bad response");
+        const data = await res.json();
+        if (cancelledRef.current) return;
+        setReport(data);
+        setError(false);
+      } catch (e) {
+        if (cancelledRef.current) return;
+        // Don't clobber an already-loaded report on a transient failure;
+        // only surface the placeholder if we never had data.
+        setError(true);
+      }
+    };
+
+    if (!sessionId) {
+      stopPolling();
+      return () => {
+        cancelledRef.current = true;
+      };
     }
-  }, [status]);
 
-  // Placeholder state
-  if (error || !report) {
+    fetchReport();
+
+    // Only poll while the run is active.
+    const isActive = status !== "COMPLETE" && status !== "STOPPED" && status !== "ERROR";
+    if (isActive) {
+      intervalRef.current = setInterval(fetchReport, 2000);
+    } else {
+      // One final fetch on terminal status, no interval.
+      stopPolling();
+    }
+
+    return () => {
+      cancelledRef.current = true;
+      stopPolling();
+    };
+  }, [sessionId, status]);
+
+  // Placeholder only when we've never successfully loaded a report.
+  if (!report) {
     return (
       <div
         style={{
@@ -76,7 +102,9 @@ export default function AgentReport({ status }) {
       >
         [ Agent report will appear here ]
         <br />
-        Connect the backend and register an agent to begin.
+        {error
+          ? "Waiting on backend…"
+          : "Connect the backend and register an agent to begin."}
       </div>
     );
   }
