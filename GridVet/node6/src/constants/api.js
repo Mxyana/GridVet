@@ -27,6 +27,7 @@ export const API = {
   SESSION:               (id) => `${BASE_URL}/session/${id}`,
   GENERATE_REPORT_CARD:  `${BASE_URL}/generate-report-card`,
   VERIFY:                `${BASE_URL}/verify`,
+  DOWNLOAD_REPORT: (id) => `${BASE_URL}/download-report/${id}`,
 };
 
 
@@ -183,28 +184,22 @@ async function _json(res) {
  * Returns the full server response, including session_id.
  */
 export async function registerAgent({ agent_name, agent_endpoint }) {
-  const clientId = getClientId();
   const res = await fetch(API.REGISTER_AGENT, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Client-Id': clientId,
-    },
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ agent_name, agent_endpoint }),
   });
   const body = await _json(res);
-
   _setSessionToken(body.session_id, body.session_token);
-  if (body.client_id && body.client_id !== clientId) {
-    // Server minted its own; adopt it so /test-history stays in sync.
-    _setClientId(body.client_id);
-  }
+  // body.proof_disclaimer is surfaced by the caller (Home.jsx).
   return body;
 }
 
 export async function runTest({ session_id, tier, mode, injection_rate, packet_delay_seconds, seed }) {
   const res = await fetch(API.RUN_TEST, {
     method: 'POST',
+    credentials:'include',
     headers: {
       'Content-Type': 'application/json',
       ..._authHeaders(session_id),
@@ -219,6 +214,7 @@ export async function runTest({ session_id, tier, mode, injection_rate, packet_d
 export async function stopTest(session_id) {
   const res = await fetch(API.STOP_TEST(session_id), {
     method: 'POST',
+    credentials: 'include',
     headers: _authHeaders(session_id),
   });
   return _json(res);
@@ -236,6 +232,33 @@ export async function getReport(session_id) {
     headers: _authHeaders(session_id),
   });
   return _json(res);
+}
+
+/**
+ * One-shot signed-report download. Server returns 410 on second call.
+ * Returns { ok: true } on success, or { ok: false, status, alreadyDownloaded }.
+ */
+export async function downloadReport(session_id) {
+  const tok = getSessionToken(session_id);
+  if (!tok) throw new Error(`No session_token for session "${session_id}".`);
+  const url = `${API.DOWNLOAD_REPORT(session_id)}?token=${encodeURIComponent(tok)}`;
+  const res = await fetch(url, { credentials: 'include' });
+  if (res.status === 410) {
+    return { ok: false, status: 410, alreadyDownloaded: true };
+  }
+  if (!res.ok) {
+    return { ok: false, status: res.status, alreadyDownloaded: false };
+  }
+  const blob = await res.blob();
+  const blobUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = blobUrl;
+  a.download = `${session_id}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(blobUrl);
+  return { ok: true };
 }
 
 export async function evictSession(session_id) {
@@ -266,9 +289,8 @@ export function streamUrl(session_id) {
  * for attaching .onmessage / .onerror / .close().
  */
 export function openStream(session_id) {
-  return new EventSource(streamUrl(session_id));
+  return new EventSource(streamUrl(session_id), { withCredentials: true });
 }
-
 /**
  * Per-browser run history. Empty list if the server has no rows for
  * our client_id (e.g. fresh incognito window).
@@ -291,6 +313,7 @@ export async function clearTestHistory() {
 export async function generateReportCard({ report, agent_name }) {
   const res = await fetch(API.GENERATE_REPORT_CARD, {
     method: 'POST',
+    credentials: 'include',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ report, agent_name }),
   });
@@ -300,6 +323,7 @@ export async function generateReportCard({ report, agent_name }) {
 export async function verifyReport(file) {
   const form = new FormData();
   form.append('file', file);
-  const res = await fetch(API.VERIFY, { method: 'POST', body: form });
+  const res = await fetch(API.VERIFY, { method: 'POST',
+  credentials: 'include', body: form });
   return _json(res);
 }
