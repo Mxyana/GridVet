@@ -7,6 +7,22 @@ const RESULT_COLORS = {
   INVALID: "#eab308", // yellow — DoS bucket
 };
 
+function safePct(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "0.0";
+  return (n * 100).toFixed(1);
+}
+
+function rawToString(raw) {
+  if (raw == null) return "(no raw output captured)";
+  if (typeof raw === "string") return raw;
+  try {
+    return JSON.stringify(raw, null, 2);
+  } catch {
+    return String(raw);
+  }
+}
+
 export default function AdvancedMetrics({ advanced = {} }) {
   const totalPackets = advanced.total_packets_processed ?? 0;
   const detectionRate = advanced.detection_rate ?? 0;
@@ -83,20 +99,16 @@ export default function AdvancedMetrics({ advanced = {} }) {
           <div style={labelStyle}>Total Packets</div>
         </div>
         <div style={card}>
-          <div style={numberStyle}>
-            {(Number(detectionRate) * 100).toFixed(1)}%
-          </div>
+          <div style={numberStyle}>{safePct(detectionRate)}%</div>
           <div style={labelStyle}>Detection Rate</div>
         </div>
         <div style={card}>
-          <div style={numberStyle}>
-            {(Number(falsePositiveRate) * 100).toFixed(1)}%
-          </div>
+          <div style={numberStyle}>{safePct(falsePositiveRate)}%</div>
           <div style={labelStyle}>False Positive Rate</div>
         </div>
         <div style={card}>
-          <div style={{ ...numberStyle, color: "#eab308" }}>
-            {(Number(invalidRate) * 100).toFixed(1)}%
+          <div style={{ ...numberStyle, color: RESULT_COLORS.INVALID }}>
+            {safePct(invalidRate)}%
           </div>
           <div style={labelStyle}>Invalid Rate (DoS)</div>
         </div>
@@ -112,7 +124,7 @@ export default function AdvancedMetrics({ advanced = {} }) {
       >
         Clean Packets: {cleanPackets} &nbsp;·&nbsp; Poisoned Packets:{" "}
         {poisonedPackets} &nbsp;·&nbsp; Invalid Packets:{" "}
-        <span style={{ color: "#eab308" }}>{invalidPackets}</span>
+        <span style={{ color: RESULT_COLORS.INVALID }}>{invalidPackets}</span>
       </div>
 
       {/* Developer-focused per-packet log with expandable raw_output rows */}
@@ -127,7 +139,7 @@ export default function AdvancedMetrics({ advanced = {} }) {
           marginBottom: 10,
         }}
       >
-        Per-Packet Log — click a row to view raw agent output
+        Per-Packet Log — click the chevron to view raw agent output
       </div>
 
       <div
@@ -139,12 +151,7 @@ export default function AdvancedMetrics({ advanced = {} }) {
           overflowY: "auto",
         }}
       >
-        <table
-          style={{
-            width: "100%",
-            borderCollapse: "collapse",
-          }}
-        >
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead
             style={{
               position: "sticky",
@@ -154,27 +161,31 @@ export default function AdvancedMetrics({ advanced = {} }) {
             }}
           >
             <tr>
-              {["", "Payload ID", "Result", "Attack Type", "Reason"].map(
-                (h, i) => (
-                  <th
-                    key={i}
-                    style={{
-                      textAlign: "left",
-                      padding: "10px 14px",
-                      color: "var(--text-secondary)",
-                      fontFamily: "Inter, sans-serif",
-                      fontWeight: 500,
-                      fontSize: 11,
-                      textTransform: "uppercase",
-                      letterSpacing: "0.08em",
-                      borderBottom: "1px solid var(--border)",
-                      width: i === 0 ? 24 : undefined,
-                    }}
-                  >
-                    {h}
-                  </th>
-                )
-              )}
+              {[
+                { key: "expand", label: "", width: 32 },
+                { key: "payload", label: "Payload ID" },
+                { key: "result", label: "Result" },
+                { key: "attack", label: "Attack Type" },
+                { key: "reason", label: "Reason" },
+              ].map((h) => (
+                <th
+                  key={h.key}
+                  style={{
+                    textAlign: "left",
+                    padding: "10px 14px",
+                    color: "var(--text-secondary)",
+                    fontFamily: "Inter, sans-serif",
+                    fontWeight: 500,
+                    fontSize: 11,
+                    textTransform: "uppercase",
+                    letterSpacing: "0.08em",
+                    borderBottom: "1px solid var(--border)",
+                    width: h.width,
+                  }}
+                >
+                  {h.label}
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody>
@@ -196,43 +207,49 @@ export default function AdvancedMetrics({ advanced = {} }) {
               </tr>
             )}
             {perPacketLog.map((row, idx) => {
-              const result = (
-                row.packet_result || row.result || "PASSED"
-              )
+              const result = (row.packet_result || row.result || "PASSED")
                 .toString()
                 .toUpperCase();
               const color = RESULT_COLORS[result] || "var(--text-secondary)";
-              const bg =
-                idx % 2 === 0 ? "var(--bg-card)" : "var(--bg-primary)";
+              const bg = idx % 2 === 0 ? "var(--bg-card)" : "var(--bg-primary)";
               const isOpen = expanded.has(idx);
-              const raw =
-                row.raw_output ||
-                row.rawOutput ||
-                "(no raw output captured)";
+              const raw = rawToString(row.raw_output ?? row.rawOutput);
               const payloadId =
                 row.source_payload_id || row.payload_id || row.id || "—";
-              const reason =
-                row.result_reason || row.reason || "—";
+              const reason = row.result_reason || row.reason || "—";
 
               return (
                 <React.Fragment key={idx}>
-                  <tr
-                    onClick={() => toggle(idx)}
-                    style={{
-                      background: bg,
-                      cursor: "pointer",
-                      userSelect: "none",
-                    }}
-                    title="Click to expand raw agent output"
-                  >
+                  <tr style={{ background: bg }}>
                     <td
                       style={{
                         ...cellStyle,
                         color: "var(--text-secondary)",
                         textAlign: "center",
+                        padding: 0,
                       }}
                     >
-                      {isOpen ? "▾" : "▸"}
+                      <button
+                        type="button"
+                        onClick={() => toggle(idx)}
+                        aria-expanded={isOpen}
+                        aria-label={
+                          isOpen
+                            ? "Collapse raw output"
+                            : "Expand raw output"
+                        }
+                        style={{
+                          background: "transparent",
+                          border: "none",
+                          color: "var(--text-secondary)",
+                          cursor: "pointer",
+                          padding: "8px 10px",
+                          fontSize: 12,
+                          lineHeight: 1,
+                        }}
+                      >
+                        {isOpen ? "▾" : "▸"}
+                      </button>
                     </td>
                     <td style={cellStyle}>{payloadId}</td>
                     <td style={{ ...cellStyle, color, fontWeight: 600 }}>
