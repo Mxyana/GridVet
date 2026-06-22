@@ -213,10 +213,8 @@ const res = await fetch(API.STATUS(sessionId), {
   credentials: 'include',
   headers: { Authorization: `Bearer ${/* same as above */ ''}` },
 });
-      if (!reportRes.ok) throw new Error("Failed to fetch report");
-      const report = await reportRes.json();
+      const report = await getReport(sessionId);
       setReportData(report);
-
       const cardRes = await fetch(API.GENERATE_REPORT_CARD, {
   method: "POST",
   credentials: "include",
@@ -286,9 +284,6 @@ const res = await fetch(API.STATUS(sessionId), {
       setRegStatus({ ok: false, message: "Please fill in both fields." });
       return;
     }
-    if (data.proof_disclaimer) {
-    setProofDisclaimer(data.proof_disclaimer);
-    }
     setRegistering(true);
     setRegStatus(null);
     
@@ -304,6 +299,9 @@ const res = await fetch(API.STATUS(sessionId), {
       if (!res.ok) throw new Error("register failed");
 
       const data = await res.json();
+      if (data.proof_disclaimer) {
+  setProofDisclaimer(data.proof_disclaimer);
+}
 
       try {
         sessionStorage.setItem("gridvet_agent_name", agentName);
@@ -337,15 +335,20 @@ const res = await fetch(API.STATUS(sessionId), {
     setCardError("");
 
     try {
+      const token = (JSON.parse(sessionStorage.getItem("gridvet_session_tokens") || "{}"))[sessionId] || "";
       const res = await fetch(API.RUN_TEST, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          tier: selectedTier,
-          mode: selectedMode,
-          session_id: sessionId,
-        }),
-      });
+        credentials: "include",
+        headers: {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${token}`,
+  },
+  body: JSON.stringify({
+    tier: selectedTier,
+    mode: selectedMode,
+    session_id: sessionId,
+  }),
+});
       // FIX (#4): don't claim RUNNING on a failed request
       if (!res.ok) throw new Error("run failed");
       setTestStatus("RUNNING");
@@ -388,6 +391,7 @@ const res = await fetch(API.STATUS(sessionId), {
             registering,
             handleRegister,
             regStatus,
+            proofDisclaimer,
           })}
           {renderRunTestCard({
             starting,
@@ -453,6 +457,7 @@ function renderRegistrationCard({
   registering,
   handleRegister,
   regStatus,
+  proofDisclaimer,
 }) {
   return (
     <div style={{ ...cardStyle, marginBottom: 24 }}>

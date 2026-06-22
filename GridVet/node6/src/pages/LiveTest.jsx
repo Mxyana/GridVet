@@ -2,7 +2,8 @@ import React, { useEffect, useState } from "react";
 import { API } from "../constants/api.js";
 import LiveFeed from "../components/LiveFeed.jsx";
 import AgentReport from "../components/AgentReport.jsx";
-
+import { openStream, stopTest as apiStopTest } from "../constants/api.js";
+import { getReport } from "../constants/api.js";
 function StatusPill({ status }) {
   if (status === "RUNNING") {
     return (
@@ -161,8 +162,7 @@ export default function LiveTest() {
       // NEW — also needs the token query param (line 161 silently relies on a
 // header-less call that the hardened backend will reject).
 // Use openStream() from api.js:
-import { openStream, stopTest as apiStopTest } from "../constants/api.js";
-source = openStream(sessionId);
+      source = openStream(sessionId);
 
       source.onopen = () =>
         setStatus((p) =>
@@ -239,7 +239,6 @@ source = openStream(sessionId);
 
     try {
       await apiStopTest(sessionId);
-      if (!res.ok) throw new Error("stop failed");
       setStatus("STOPPED");
       setStopMsg({
         ok: true,
