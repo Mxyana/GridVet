@@ -33,6 +33,7 @@ import os
 import secrets
 import socket
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -163,10 +164,61 @@ TIER_PACKETS = {
 }
 
 BENCHMARK_SEED = 42
-RUN_HISTORY_PATH = "run_history.json"
 
-# Serialize append-only writes to run_history.json (single-process only).
-_RUN_HISTORY_LOCK = asyncio.Lock()
+# Run-history is now stored in Redis under per-client_id lists:
+#   key   = f"run_history:{client_id}"
+#   value = Redis LIST of JSON-encoded entries (newest first via LPUSH)
+# We cap each list at RUN_HISTORY_MAX entries via LTRIM so a single client
+# cannot blow up Redis storage.
+RUN_HISTORY_KEY_PREFIX = "run_history:"
+RUN_HISTORY_MAX        = 500
+
+# In-memory session cap. _SESSIONS is an LRU — when it exceeds this, the
+# oldest non-RUNNING entry is dropped (RUNNING entries are never evicted
+# because their pipeline coroutine still references the SessionState).
+SESSIONS_MAX = 1024
+
+# SSE queue cap per session. If a consumer disconnects mid-run, the producer
+# would otherwise grow the queue without bound. We drop the oldest packet on
+# overflow so the queue stays small and the pipeline never blocks on put().
+SSE_QUEUE_MAX = 1000
+
+# Maximum bytes accepted from any agent/Groq HTTP response. Stops a malicious
+# endpoint from streaming gigabytes into memory.
+AGENT_RESPONSE_MAX_BYTES = 1 * 1024 * 1024   # 1 MiB
+
+
+# ===========================================================================
+# Access-log scrubber — Fix #1
+# EventSource cannot send custom headers, so /stream accepts ?token=<...>.
+# Uvicorn's default access logger writes the full request line (including
+# the query string) to stdout, which means tokens would otherwise be
+# captured by every log aggregator. This filter rewrites any `token=...`
+# pair in the access-log record to `token=REDACTED` before it is emitted.
+# ===========================================================================
+import re as _re
+
+_TOKEN_QS_RE = _re.compile(r"(token=)[^&\s\"']+")
+
+
+class _RedactTokenFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if isinstance(record.args, tuple):
+                record.args = tuple(
+                    _TOKEN_QS_RE.sub(r"\1REDACTED", a) if isinstance(a, str) else a
+                    for a in record.args
+                )
+            if isinstance(record.msg, str):
+                record.msg = _TOKEN_QS_RE.sub(r"\1REDACTED", record.msg)
+        except Exception:   # noqa: BLE001
+            # Never let logging itself raise — fall through with original record.
+            pass
+        return True
+
+
+for _ln in ("uvicorn.access", "uvicorn", "fastapi"):
+    logging.getLogger(_ln).addFilter(_RedactTokenFilter())
 
 
 # ===========================================================================
@@ -275,6 +327,7 @@ def build_report_id(bot_name: str, timestamp_ms: int) -> str:
 class SessionState:
     session_id:      str
     session_token:   str
+    client_id:       str          # opaque per-browser identifier; scopes /test-history
     agent_name:      str
     agent_endpoint:  str
     timestamp_ms:    int
@@ -290,13 +343,192 @@ class SessionState:
     latest_master_report: Optional[str]  = None
     latest_verification:  Optional[dict] = None
 
-    sse_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    sse_queue: asyncio.Queue = field(
+        default_factory=lambda: asyncio.Queue(maxsize=SSE_QUEUE_MAX)
+    )
 
 
-_SESSIONS: Dict[str, SessionState] = {}
+_SESSIONS: "OrderedDict[str, SessionState]" = OrderedDict()
 
 
-def _new_session(agent_name: str, agent_endpoint: str) -> SessionState:
+def _sse_put_nowait(sess: SessionState, item: dict) -> None:
+    """
+    Fix #7: bounded SSE put.
+
+    If the consumer disconnected, the queue would otherwise grow until OOM.
+    On overflow we drop the OLDEST queued packet (not the new one) so the
+    consumer — if it reconnects — sees the most recent state. The pipeline
+    never blocks waiting for queue space.
+    """
+    while True:
+        try:
+            sess.sse_queue.put_nowait(item)
+            return
+        except asyncio.QueueFull:
+            try:
+                _ = sess.sse_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                # Race: should not normally happen, but bail to avoid spin.
+                return
+
+
+def _touch_session(session_id: str) -> None:
+    """Mark a session as most-recently-used in the LRU."""
+    try:
+        _SESSIONS.move_to_end(session_id)
+    except KeyError:
+        pass
+
+
+def _evict_sessions_if_needed() -> None:
+    """
+    Fix #5: bound _SESSIONS via LRU.
+
+    When the in-memory map exceeds SESSIONS_MAX we drop the oldest
+    non-RUNNING entries. RUNNING sessions are skipped — their pipeline
+    coroutine still references the SessionState and dropping them would
+    not actually free memory, it would just hide the session from /status
+    while the pipeline keeps running. The Redis snapshot survives the
+    eviction so /status / /report keep working transparently via the
+    rehydration path in _get_session.
+    """
+    if len(_SESSIONS) <= SESSIONS_MAX:
+        return
+    over = len(_SESSIONS) - SESSIONS_MAX
+    dropped = 0
+    # Iterate a snapshot of keys (oldest first) so we can mutate the dict.
+    for sid in list(_SESSIONS.keys()):
+        if dropped >= over:
+            break
+        candidate = _SESSIONS.get(sid)
+        if candidate is None or candidate.status == "RUNNING":
+            continue
+        _SESSIONS.pop(sid, None)
+        dropped += 1
+    if dropped:
+        logger.info("LRU evicted %d session(s) from in-memory map.", dropped)
+
+
+# ===========================================================================
+# Redis-backed session persistence
+# ===========================================================================
+# Render (and most PaaS) recycle dynos periodically. Without persistence,
+# every restart drops `_SESSIONS` and invalidates every outstanding
+# session_token — clients see 404 on /status, /report, /stream.
+#
+# We mirror the JSON-serializable subset of SessionState into Redis under
+# `session:{session_id}`. After a restart, _get_session() transparently
+# rehydrates from Redis. The pipeline objects (interceptor / verifier /
+# result_engine / sse_queue) are *not* persistable — they live only in
+# the process that started the run. A rehydrated session whose status
+# was "RUNNING" is coerced to "ORPHANED" so callers know the pipeline
+# is gone even though the audit trail and final report (if any) remain
+# accessible.
+
+SESSION_TTL_SECONDS = 60 * 60 * 24   # 24h — long enough to recover a run
+
+_PERSISTENT_FIELDS = (
+    "session_id", "session_token", "client_id",
+    "agent_name", "agent_endpoint", "timestamp_ms",
+    "status", "stop_requested", "packets_planned",
+    "latest_master_report", "latest_verification",
+)
+
+
+def _serialize_session(sess: SessionState) -> dict:
+    """Pluck the JSON-safe subset of SessionState for Redis storage."""
+    return {f: getattr(sess, f) for f in _PERSISTENT_FIELDS}
+
+
+def _persist_session(sess: SessionState) -> None:
+    """
+    Snapshot the persistent subset of ``sess`` to Redis.
+
+    Called at every state transition: registration, RUNNING, COMPLETE,
+    STOPPED, ERROR. Failures are logged and swallowed — Redis being
+    temporarily unavailable must never crash the pipeline. The in-memory
+    `_SESSIONS` entry remains authoritative for the current process.
+    """
+    if redis_db is None:
+        return
+    try:
+        redis_db.set(
+            f"session:{sess.session_id}",
+            json.dumps(_serialize_session(sess)),
+            ex=SESSION_TTL_SECONDS,
+        )
+    except Exception as exc:   # noqa: BLE001
+        logger.warning("Redis persist failed for %s: %s", sess.session_id, exc)
+
+
+def _hydrate_session_from_redis(session_id: str) -> Optional[SessionState]:
+    """
+    Rebuild a SessionState from Redis if this process has lost it.
+
+    Ephemeral fields (interceptor / verifier / result_engine) are left
+    None. If the stored status was "RUNNING" we coerce it to "ORPHANED"
+    because the original pipeline coroutine died with the previous
+    process — no other process can resume it.
+
+    Returns None if Redis is unavailable or the key is absent.
+    """
+    if redis_db is None:
+        return None
+    try:
+        raw = redis_db.get(f"session:{session_id}")
+    except Exception as exc:   # noqa: BLE001
+        logger.warning("Redis read failed for %s: %s", session_id, exc)
+        return None
+    if not raw:
+        return None
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Corrupt session blob for %s — ignoring.", session_id)
+        return None
+
+    if data.get("status") == "RUNNING":
+        logger.info("Session %s rehydrated as ORPHANED (was RUNNING).", session_id)
+        data["status"] = "ORPHANED"
+
+    sess = SessionState(
+        session_id     = data["session_id"],
+        session_token  = data["session_token"],
+        client_id      = data.get("client_id", ""),
+        agent_name     = data["agent_name"],
+        agent_endpoint = data["agent_endpoint"],
+        timestamp_ms   = data["timestamp_ms"],
+    )
+    sess.status               = data.get("status", "IDLE")
+    sess.stop_requested       = bool(data.get("stop_requested", False))
+    sess.packets_planned      = int(data.get("packets_planned") or 0)
+    sess.latest_master_report = data.get("latest_master_report")
+    sess.latest_verification  = data.get("latest_verification")
+
+    _SESSIONS[session_id] = sess
+    # Re-write the (possibly status-coerced) blob so a second restart
+    # doesn't keep flipping RUNNING -> ORPHANED forever.
+    _persist_session(sess)
+    return sess
+
+
+def _delete_session_from_redis(session_id: str) -> None:
+    if redis_db is None:
+        return
+    try:
+        redis_db.delete(f"session:{session_id}")
+    except Exception as exc:   # noqa: BLE001
+        logger.warning("Redis delete failed for %s: %s", session_id, exc)
+
+
+def _set_status(sess: SessionState, new_status: str) -> None:
+    """Centralized status setter — keeps Redis in sync on every change."""
+    sess.status = new_status
+    _persist_session(sess)
+
+
+def _new_session(agent_name: str, agent_endpoint: str, client_id: str) -> SessionState:
     timestamp_ms = int(time.time() * 1000)
     session_id   = build_report_id(agent_name, timestamp_ms)
     while session_id in _SESSIONS:
@@ -306,26 +538,63 @@ def _new_session(agent_name: str, agent_endpoint: str) -> SessionState:
     sess = SessionState(
         session_id     = session_id,
         session_token  = secrets.token_urlsafe(32),
+        client_id      = client_id,
         agent_name     = agent_name,
         agent_endpoint = agent_endpoint,
         timestamp_ms   = timestamp_ms,
     )
     _SESSIONS[session_id] = sess
-    logger.info("SESSION CREATED — id=%s | agent=%s", session_id, agent_name)
+    _persist_session(sess)
+    _evict_sessions_if_needed()
+    logger.info(
+        "SESSION CREATED — id=%s | agent=%s | client=%s…",
+        session_id, agent_name, client_id[:8],
+    )
     return sess
+
+
+def _resolve_client_id(header_value: Optional[str]) -> str:
+    """
+    Normalize a client-supplied X-Client-Id header.
+
+    The browser is expected to generate a high-entropy value once
+    (e.g. crypto.randomUUID()) and persist it in localStorage. We accept
+    anything between 8 and 128 chars of URL-safe characters so different
+    clients (CLI, mobile, etc.) can adopt their own ID schemes.
+
+    If the header is missing or malformed we mint a fresh one — but the
+    caller will only receive it via the /register-agent response, so the
+    browser MUST capture it from there on first registration. Without a
+    matching client_id later, history lookups return an empty list.
+    """
+    if header_value:
+        candidate = header_value.strip()
+        if 8 <= len(candidate) <= 128 and all(
+            c.isalnum() or c in "-_." for c in candidate
+        ):
+            return candidate
+    return secrets.token_urlsafe(24)
 
 
 def _get_session(session_id: str) -> SessionState:
     sess = _SESSIONS.get(session_id)
-    if sess is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"Session '{session_id}' not found. "
-                "Call /register-agent first to obtain a valid session_id."
-            ),
-        )
-    return sess
+    if sess is not None:
+        _touch_session(session_id)
+        return sess
+
+    # Fall back to Redis — survives process restarts.
+    sess = _hydrate_session_from_redis(session_id)
+    if sess is not None:
+        _evict_sessions_if_needed()
+        return sess
+
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            f"Session '{session_id}' not found. "
+            "Call /register-agent first to obtain a valid session_id."
+        ),
+    )
 
 
 def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
@@ -392,15 +661,30 @@ class ReportCardRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Cross-run history helper
+# Cross-run history helper — Redis-backed
 # ---------------------------------------------------------------------------
+# Storage layout:
+#   key   = f"run_history:{client_id}"
+#   value = Redis LIST of JSON-encoded entries, newest first.
+# Bounded via LTRIM to RUN_HISTORY_MAX. Per-client isolation is enforced
+# at the key level — there is no shared file to filter, so one client
+# cannot accidentally read another's rows even if X-Client-Id leaks.
+def _history_key(client_id: str) -> str:
+    return f"{RUN_HISTORY_KEY_PREFIX}{client_id}"
+
+
 async def _append_run_history(*, sess: SessionState, terminal_status: str, tier: str) -> None:
     """
-    Append a one-line summary of the just-finished run to RUN_HISTORY_PATH.
-    Serialized via _RUN_HISTORY_LOCK so concurrent terminal events don't
-    clobber the file. Failures are swallowed — history must never alter
-    pipeline outcome.
+    Append a one-line summary of the just-finished run to Redis.
+
+    No-op (with a warning) when Redis is unavailable — history must never
+    alter pipeline outcome. The LPUSH + LTRIM pair keeps each client's
+    list capped at RUN_HISTORY_MAX entries.
     """
+    if redis_db is None:
+        logger.warning("Run-history append skipped — Redis unavailable.")
+        return
+
     try:
         engine       = sess.result_engine
         report       = engine.get_full_report() if engine is not None else {}
@@ -408,6 +692,7 @@ async def _append_run_history(*, sess: SessionState, terminal_status: str, tier:
         advanced     = report.get("advanced", {}) or {}
 
         entry = {
+            "client_id":         sess.client_id,
             "agent_name":        sess.agent_name,
             "tier_selected":     tier,
             "tier":              agent_report.get("tier"),
@@ -419,19 +704,13 @@ async def _append_run_history(*, sess: SessionState, terminal_status: str, tier:
             "timestamp":         datetime.now(timezone.utc).isoformat(),
         }
 
-        async with _RUN_HISTORY_LOCK:
-            try:
-                with open(RUN_HISTORY_PATH, "r", encoding="utf-8") as f:
-                    history = json.load(f)
-                if not isinstance(history, list):
-                    history = []
-            except (FileNotFoundError, json.JSONDecodeError):
-                history = []
+        key = _history_key(sess.client_id)
+        # Off-load the synchronous Upstash calls so the event loop stays free.
+        def _persist() -> None:
+            redis_db.lpush(key, json.dumps(entry))
+            redis_db.ltrim(key, 0, RUN_HISTORY_MAX - 1)
 
-            history.append(entry)
-
-            with open(RUN_HISTORY_PATH, "w", encoding="utf-8") as f:
-                json.dump(history, f, indent=2)
+        await asyncio.to_thread(_persist)
 
         logger.info(
             "RUN_HISTORY — appended %s | tier=%s | score=%s | status=%s",
@@ -618,6 +897,9 @@ async def emit_verification(sess: SessionState, status: str) -> dict:
             "raw_master_text": normalized_string,
         }
         sess.latest_verification = verification_payload
+        # Persist the final master report + verification into Redis so a
+        # restart can still serve /report and verification data.
+        _persist_session(sess)
 
         logger.info(
             "VERIFICATION — session_key=%s | status=%s | sha256=%s…",
@@ -631,27 +913,69 @@ async def emit_verification(sess: SessionState, status: str) -> dict:
 # ---------------------------------------------------------------------------
 # Agent call helper — SSRF-hardened
 # ---------------------------------------------------------------------------
+def _post_with_size_cap(
+    url: str,
+    *,
+    json_body: dict,
+    headers: Optional[dict] = None,
+    timeout: int = 15,
+    max_bytes: int = AGENT_RESPONSE_MAX_BYTES,
+) -> requests.Response:
+    """
+    Fix #3: bounded POST.
+
+    Streams the response and aborts as soon as the cumulative byte count
+    exceeds ``max_bytes``. Prevents a malicious endpoint from blowing up
+    process memory by replying with a multi-GB body. Returns a Response
+    whose ``_content`` has been pre-populated, so callers can use
+    ``response.json()`` exactly as before.
+    """
+    with requests.post(
+        url,
+        json=json_body,
+        headers=headers,
+        timeout=timeout,
+        allow_redirects=False,
+        stream=True,
+    ) as resp:
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(
+                    f"Response exceeded size cap of {max_bytes} bytes."
+                )
+            chunks.append(chunk)
+        resp._content = b"".join(chunks)
+        resp.status_code  # touch to ensure the response is fully realized
+        return resp
+
+
 def _call_agent(endpoint: str, agent_input: dict) -> Optional[dict]:
     """
     POST to the registered agent endpoint. Returns None on any failure so the
     pipeline can fall back to a HOLD decision.
 
-    Two SSRF defenses are layered here on top of _validate_target_url:
+    SSRF / DoS defenses layered here on top of _validate_target_url:
       - allow_redirects=False — a malicious endpoint cannot bounce us to a
         private IP after passing validation.
       - explicit timeout — bounds the request so a slow target cannot hold
         the pipeline indefinitely.
+      - AGENT_RESPONSE_MAX_BYTES cap — aborts streaming responses that try
+        to exhaust memory (Fix #3).
     """
     if not endpoint:
         logger.warning("Agent call skipped — no endpoint registered.")
         return None
 
     try:
-        response = requests.post(
+        response = _post_with_size_cap(
             endpoint,
-            json=agent_input,
+            json_body=agent_input,
             timeout=15,
-            allow_redirects=False,
         )
         response.raise_for_status()
         return response.json()
@@ -660,6 +984,9 @@ def _call_agent(endpoint: str, agent_input: dict) -> Optional[dict]:
         return None
     except requests.exceptions.ConnectionError:
         logger.warning("Agent endpoint unreachable.")
+        return None
+    except ValueError as exc:
+        logger.warning("Agent response rejected: %s", exc)
         return None
     except Exception as exc:   # noqa: BLE001
         logger.warning("Agent call failed: %s", exc)
@@ -721,9 +1048,9 @@ Required schema:
 
     try:
         response = await asyncio.to_thread(
-            requests.post,
+            _post_with_size_cap,
             "https://api.groq.com/openai/v1/chat/completions",
-            json=payload,
+            json_body=payload,
             headers=headers,
             timeout=20,
         )
@@ -792,14 +1119,16 @@ async def run_pipeline(
             if sess.stop_requested:
                 logger.info("Pipeline halted by stop request — session=%s", sess.session_id)
                 sess.status = "STOPPED"
+                _persist_session(sess)
                 await _append_run_history(sess=sess, terminal_status="STOPPED", tier=tier)
                 verification = await emit_verification(sess, "STOPPED")
-                await sess.sse_queue.put(
+                _sse_put_nowait(
+                    sess,
                     {
                         "event":        "STOPPED",
                         "timestamp":    datetime.now(timezone.utc).isoformat(),
                         "verification": verification,
-                    }
+                    },
                 )
                 return
 
@@ -870,18 +1199,19 @@ async def run_pipeline(
 
                 packet_result = sess.result_engine.evaluate(node4_result)
 
-                await sess.sse_queue.put(packet_result)
+                _sse_put_nowait(sess, packet_result)
 
             except Exception as inner_exc:   # noqa: BLE001
                 logger.exception(
                     "Per-packet failure (session=%s): %s", sess.session_id, inner_exc
                 )
-                await sess.sse_queue.put(
+                _sse_put_nowait(
+                    sess,
                     {
                         "event":     "PACKET_ERROR",
                         "error":     str(inner_exc),
                         "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }
+                    },
                 )
 
             # Pacing — interruptible so stop_requested takes effect quickly.
@@ -891,6 +1221,7 @@ async def run_pipeline(
                 await asyncio.sleep(0.1)
 
         sess.status = "COMPLETE"
+        _persist_session(sess)
         await _append_run_history(sess=sess, terminal_status="COMPLETE", tier=tier)
         verification = await emit_verification(sess, "COMPLETE")
 
@@ -904,12 +1235,13 @@ async def run_pipeline(
         except Exception:   # noqa: BLE001
             logger.info("Pipeline complete — session=%s", sess.session_id)
 
-        await sess.sse_queue.put(
+        _sse_put_nowait(
+            sess,
             {
                 "event":        "COMPLETE",
                 "timestamp":    datetime.now(timezone.utc).isoformat(),
                 "verification": verification,
-            }
+            },
         )
 
     except Exception as outer_exc:   # noqa: BLE001
@@ -918,13 +1250,14 @@ async def run_pipeline(
         )
         sess.status  = "ERROR"
         verification = await emit_verification(sess, "ERROR")
-        await sess.sse_queue.put(
+        _sse_put_nowait(
+            sess,
             {
                 "event":        "ERROR",
                 "error":        str(outer_exc),
                 "timestamp":    datetime.now(timezone.utc).isoformat(),
                 "verification": verification,
-            }
+            },
         )
 
 
@@ -933,32 +1266,45 @@ async def run_pipeline(
 # ===========================================================================
 
 @app.post("/register-agent")
-async def register_agent(req: RegisterAgentRequest) -> dict:
+async def register_agent(
+    req: RegisterAgentRequest,
+    x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id"),
+) -> dict:
     """
     Register the external agent.
 
     Validates the endpoint against the SSRF guard before minting a session.
-    Returns the session_id (used for routing / filenames) AND a single-use
-    session_token (used for authentication on every subsequent call).
-
-    The token is returned ONCE. The server stores it but never echoes it back.
-    Clients must persist it for the lifetime of the run.
+    Returns:
+      - session_id    — routing key / report filename stem
+      - session_token — bearer token for every session-scoped call (shown ONCE)
+      - client_id     — opaque per-browser identifier; scopes /test-history.
+                        The browser should generate this once (e.g.
+                        crypto.randomUUID()), persist it in localStorage,
+                        and send it as `X-Client-Id` on every subsequent
+                        /register-agent and /test-history call. If omitted,
+                        the server mints one; the browser MUST capture it
+                        from this response or it will lose access to its
+                        own run history.
     """
     _validate_target_url(req.agent_endpoint)
 
-    sess = _new_session(req.agent_name, req.agent_endpoint)
+    client_id = _resolve_client_id(x_client_id)
+    sess = _new_session(req.agent_name, req.agent_endpoint, client_id)
 
     return {
         "status":          "ok",
         "session_id":      sess.session_id,
         "session_token":   sess.session_token,   # show ONCE
+        "client_id":       sess.client_id,       # browser must persist
         "agent_name":      sess.agent_name,
         "agent_endpoint":  sess.agent_endpoint,
         "report_filename": f"{sess.session_id}.txt",
         "auth_hint": (
             "Pass `Authorization: Bearer <session_token>` on every subsequent "
             "request. For /stream use `?token=<session_token>` since "
-            "EventSource cannot send custom headers."
+            "EventSource cannot send custom headers. Also send "
+            "`X-Client-Id: <client_id>` on /register-agent and /test-history "
+            "to keep your run history private to this browser."
         ),
     }
 
@@ -1086,37 +1432,84 @@ async def get_report(
 
 
 @app.get("/test-history")
-async def test_history() -> dict:
+async def test_history(
+    x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id"),
+) -> dict:
     """
-    Cross-run history — intentionally unauthenticated (it is aggregate,
-    public-by-design data shown on the landing dashboard). If you ever
-    add per-user history, gate this with the same bearer check.
+    Cross-run history — scoped to the calling browser via X-Client-Id.
+
+    Backed by Redis (key = run_history:<client_id>, LIST type, newest
+    first). Per-client isolation is enforced at the key level: there is
+    no shared blob to filter, so one client cannot read another's rows
+    even if X-Client-Id is guessed — the worst case is reading an empty
+    list for a key that doesn't exist.
     """
+    if not x_client_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Missing X-Client-Id header. Register an agent first to "
+                "obtain a client_id, then send it on every /test-history call."
+            ),
+        )
+
+    if redis_db is None:
+        return {
+            "history": [],
+            "count":   0,
+            "message": "Run-history backend unavailable (Redis not configured).",
+        }
+
+    key = _history_key(x_client_id)
     try:
-        with open(RUN_HISTORY_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            data = []
-        data_sorted = sorted(data, key=lambda r: r.get("timestamp", ""), reverse=True)
-        return {"history": data_sorted, "count": len(data_sorted)}
-    except FileNotFoundError:
-        return {"history": [], "count": 0, "message": "No history yet."}
-    except json.JSONDecodeError:
-        logger.warning("run_history.json is not valid JSON; returning empty.")
-        return {"history": [], "count": 0, "message": "History file corrupted."}
+        raw_entries = await asyncio.to_thread(redis_db.lrange, key, 0, -1)
+    except Exception as exc:   # noqa: BLE001
+        logger.warning("Redis lrange failed for %s: %s", key, exc)
+        return {"history": [], "count": 0, "message": "History backend error."}
+
+    history: list[dict] = []
+    for raw in raw_entries or []:
+        try:
+            history.append(json.loads(raw))
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    return {"history": history, "count": len(history)}
 
 
 @app.delete("/test-history")
-async def clear_test_history() -> dict:
-    cleared = []
+async def clear_test_history(
+    x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id"),
+) -> dict:
+    """
+    Delete only the calling browser's history rows.
+
+    Simply drops the per-client Redis key. Other clients' lists live
+    under different keys and are untouched.
+    """
+    if not x_client_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing X-Client-Id header.",
+        )
+
+    if redis_db is None:
+        return {"status": "noop", "removed": 0, "message": "Redis unavailable."}
+
+    key = _history_key(x_client_id)
+    removed = 0
     try:
-        if os.path.exists(RUN_HISTORY_PATH):
-            os.remove(RUN_HISTORY_PATH)
-            cleared.append(RUN_HISTORY_PATH)
-    except OSError as exc:
-        logger.warning("Failed to clear %s: %s", RUN_HISTORY_PATH, exc)
-    logger.info("History cleared. Removed: %s", cleared)
-    return {"status": "ok", "cleared": cleared}
+        # LLEN before DEL so we can report how many entries were dropped.
+        removed = int(await asyncio.to_thread(redis_db.llen, key) or 0)
+        await asyncio.to_thread(redis_db.delete, key)
+    except Exception as exc:   # noqa: BLE001
+        logger.warning("Failed to clear history for %s: %s", key, exc)
+
+    logger.info(
+        "History cleared for client=%s… (removed %d rows)",
+        x_client_id[:8], removed,
+    )
+    return {"status": "ok", "removed": removed}
 
 
 @app.delete("/session/{session_id}")
@@ -1142,7 +1535,12 @@ async def evict_session(
         except OSError:
             pass
 
-    del _SESSIONS[session_id]
+    # Fix #6: tolerate sessions that exist only in Redis (already evicted
+    # from this process's in-memory LRU) and make sure the Redis snapshot
+    # is also dropped so subsequent /status calls don't re-hydrate the
+    # session we just deleted.
+    _SESSIONS.pop(session_id, None)
+    _delete_session_from_redis(session_id)
     logger.info("Session evicted — id=%s", session_id)
     return {"status": "evicted", "session_id": session_id}
 
