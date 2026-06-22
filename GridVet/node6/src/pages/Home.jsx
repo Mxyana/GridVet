@@ -4,6 +4,16 @@ import { API } from "../constants/api.js";
 import TierBadge from "../components/TierBadge.jsx";
 import { BASE_URL } from "../constants/api.js";
 
+import {
+  registerAgent,
+  runTest,
+  getStatus,
+  getReport,
+  getTestHistory,
+  generateReportCard,
+  downloadReport as downloadReportApi,
+} from "../constants/api.js";
+
 const cardStyle = {
   background: "var(--bg-card)",
   border: "1px solid var(--border)",
@@ -123,7 +133,10 @@ export default function Home() {
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch(API.TEST_HISTORY, { credentials: 'include' });
+        const rows = await getTestHistory();
+        if (!cancelled) {
+          setHistory(Array.isArray(rows) ? rows : []);
+        }
         if (!res.ok) throw new Error("bad response");
         const data = await res.json();
         const rows = Array.isArray(data)
@@ -157,12 +170,9 @@ export default function Home() {
       try {
         // NEW — note: status endpoint also needs the Bearer token; preferred path is
 // to call getStatus(sessionId) from api.js. Minimum-change form:
-const res = await fetch(API.STATUS(sessionId), {
-  credentials: 'include',
-  headers: { Authorization: `Bearer ${JSON.parse(sessionStorage.getItem('gridvet_session_tokens') || '{}')[sessionId] || ''}` },
-});
-        if (!res.ok) throw new Error("bad status");
-        const data = await res.json();
+
+        const data = await getStatus(sessionId);
+
         const next = data.status;
 
         setTestStatus((prev) => (prev !== next ? next : prev));
@@ -209,19 +219,16 @@ const res = await fetch(API.STATUS(sessionId), {
     setCardLoading(true);
     setCardError("");
     try {
-      const reportRes = await fetch(API.REPORT(sessionId), {
-  credentials: 'include',
-  headers: { Authorization: `Bearer ${/* same as above */ ''}` },
-});
+      const report = await getReport(sessionId);
+setReportData(report);
       const report = await getReport(sessionId);
       setReportData(report);
-      const cardRes = await fetch(API.GENERATE_REPORT_CARD, {
-  method: "POST",
-  credentials: "include",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ report, agent_name: agentNameRef.current || "Agent" }),
+      
+      const cardData = await generateReportCard({
+  report,
+  agent_name: agentNameRef.current || "Agent",
 });
-      const cardData = await cardRes.json();
+
       setNarrative(cardData.narrative || "");
     } catch (err) {
       setCardError("Failed to generate report card.");
@@ -231,21 +238,25 @@ const res = await fetch(API.STATUS(sessionId), {
   }
 
   async function downloadReport() {
-  const sessionId = sessionStorage.getItem("gridvet_session_id");
-  if (!sessionId) {
-    setCardError("Session missing. Please re-register the agent.");
-    return;
-  }
-  // Pull bearer token the same way api.js does.
-  let token = "";
-  try {
-    token = (JSON.parse(sessionStorage.getItem("gridvet_session_tokens") || "{}"))[sessionId] || "";
-  } catch {}
-  if (!token) {
-    setCardError("Session token missing. Please re-register the agent.");
-    return;
-  }
+  const result = await downloadReportApi(sessionId);
 
+if (result.alreadyDownloaded) {
+  setCardError(
+    "This report was already downloaded. Re-run the test to obtain a fresh signed report."
+  );
+
+  setReportData((prev) =>
+    prev
+      ? {
+          ...prev,
+          downloaded: true,
+          raw_master_text: null,
+        }
+      : prev
+  );
+
+  return;
+}
   const url = `${BASE_URL}/download-report/${sessionId}?token=${encodeURIComponent(token)}`;
   let res;
   try {
@@ -288,14 +299,10 @@ const res = await fetch(API.STATUS(sessionId), {
     setRegStatus(null);
     
     try {
-      const res = await fetch(API.REGISTER_AGENT, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          agent_name: agentName,
-          agent_endpoint: agentEndpoint,
-        }),
-      });
+      const data = await registerAgent({
+  agent_name: agentName,
+  agent_endpoint: agentEndpoint,
+});
       if (!res.ok) throw new Error("register failed");
 
       const data = await res.json();
@@ -335,20 +342,13 @@ const res = await fetch(API.STATUS(sessionId), {
     setCardError("");
 
     try {
-      const token = (JSON.parse(sessionStorage.getItem("gridvet_session_tokens") || "{}"))[sessionId] || "";
-      const res = await fetch(API.RUN_TEST, {
-        method: "POST",
-        credentials: "include",
-        headers: {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${token}`,
-  },
-  body: JSON.stringify({
-    tier: selectedTier,
-    mode: selectedMode,
-    session_id: sessionId,
-  }),
+      await runTest({
+  session_id: sessionId,
+  tier: selectedTier,
+  mode: selectedMode,
 });
+      
+
       // FIX (#4): don't claim RUNNING on a failed request
       if (!res.ok) throw new Error("run failed");
       setTestStatus("RUNNING");
