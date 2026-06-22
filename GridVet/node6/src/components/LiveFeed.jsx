@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { API } from "../constants/api.js";
-
+import { openStream } from"../constants/api.js"
 const RESULT_COLORS = {
   PASSED: "var(--green)",
   FAILED: "var(--red)",
@@ -51,8 +51,8 @@ export default function LiveFeed({ sessionId }) {
       // NEW — also needs the token query param (line 161 silently relies on a
 // header-less call that the hardened backend will reject).
 // Use openStream() from api.js:
-import { openStream, stopTest as apiStopTest } from "../constants/api.js";
-source = openStream(sessionId);
+
+      source = openStream(sessionId);
 
       source.onopen = () => setConnected(true);
 
