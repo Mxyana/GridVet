@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { NavLink } from "react-router-dom";
 
 const navItems = [
@@ -8,10 +8,8 @@ const navItems = [
   { to: "/verify", label: "Verify Result", end: false },
 ];
 
-export default function Sidebar() {
-  const [open, setOpen] = useState(false);
-
-  const NavInner = () => (
+function NavInner({ onNavigate }) {
+  return (
     <div className="flex flex-col h-full">
       {/* Top brand */}
       <div style={{ padding: "50px 20px 20px 20px" }}>
@@ -24,7 +22,7 @@ export default function Sidebar() {
             letterSpacing: "-0.01em",
           }}
         >
-         GridVet
+          GridVet
         </div>
         <div
           style={{
@@ -45,7 +43,7 @@ export default function Sidebar() {
             key={item.to}
             to={item.to}
             end={item.end}
-            onClick={() => setOpen(false)}
+            onClick={onNavigate}
             className="sidebar-link"
           >
             {({ isActive }) => (
@@ -62,7 +60,6 @@ export default function Sidebar() {
                   fontSize: "13px",
                   borderRadius: "4px",
                   transition: "all 150ms ease",
-                  cursor: "pointer",
                 }}
               >
                 {item.label}
@@ -86,14 +83,38 @@ export default function Sidebar() {
       </div>
     </div>
   );
+}
+
+export default function Sidebar() {
+  const [open, setOpen] = useState(false);
+
+  // Lock body scroll and wire Escape-to-close while the mobile drawer is open.
+  useEffect(() => {
+    if (!open) return;
+
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    const onKey = (e) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
 
   return (
     <>
       {/* Mobile hamburger */}
       <button
         className="md:hidden"
-        onClick={() => setOpen(!open)}
+        onClick={() => setOpen((v) => !v)}
         aria-label="Toggle navigation"
+        aria-expanded={open}
+        aria-controls="mobile-nav-drawer"
         style={{
           position: "fixed",
           top: 14,
@@ -111,9 +132,9 @@ export default function Sidebar() {
         }}
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-          <span style={{ width: 14, height: 1.5, background: "currentColor" }} />
-          <span style={{ width: 14, height: 1.5, background: "currentColor" }} />
-          <span style={{ width: 14, height: 1.5, background: "currentColor" }} />
+          <span style={{ width: 14, height: 2, background: "currentColor" }} />
+          <span style={{ width: 14, height: 2, background: "currentColor" }} />
+          <span style={{ width: 14, height: 2, background: "currentColor" }} />
         </div>
       </button>
 
@@ -144,7 +165,11 @@ export default function Sidebar() {
             }}
           />
           <aside
+            id="mobile-nav-drawer"
             className="md:hidden fade-in"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Main navigation"
             style={{
               position: "fixed",
               top: 0,
@@ -157,7 +182,7 @@ export default function Sidebar() {
               display: "flex",
             }}
           >
-            <NavInner />
+            <NavInner onNavigate={() => setOpen(false)} />
           </aside>
         </>
       )}
