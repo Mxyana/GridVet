@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { API } from "../constants/api.js";
-import { openStream } from"../constants/api.js"
+import { openStream } from"../constants/api.js";
 const RESULT_COLORS = {
   PASSED: "var(--green)",
   FAILED: "var(--red)",
