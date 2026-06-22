@@ -1576,7 +1576,7 @@ async def download_report(
     if not sess.latest_master_report:
         raise HTTPException(
             status_code=409,
-            detail="Report is not ready yet — wait for the run to complete.",
+            detail="Report is not ready yet - wait for the run to complete.",
         )
 
     if sess.report_downloaded:
@@ -1584,7 +1584,7 @@ async def download_report(
             status_code=410,
             detail=(
                 "This report has already been downloaded. The file you saved "
-                "previously is the only valid proof — re-run the test to "
+                "previously is the only valid proof - re-run the test to "
                 "obtain a fresh signed report."
             ),
         )
@@ -1600,7 +1600,7 @@ async def download_report(
         headers={
             "Content-Disposition": f'attachment; filename="{session_id}.txt"',
             "X-Proof-Disclaimer":
-                "ONE_SHOT_DOWNLOAD — server will not re-issue this file; "
+                "ONE_SHOT_DOWNLOAD - server will not re-issue this file; "
                 "verify your saved copy via POST /verify.",
         },
     )
