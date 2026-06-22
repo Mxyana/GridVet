@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { API } from "../constants/api.js";
 import TierBadge from "../components/TierBadge.jsx";
+import { BASE_URL } from "../constants/api.js";
 
 const cardStyle = {
   background: "var(--bg-card)",
@@ -86,6 +87,7 @@ export default function Home() {
 
   const [agentName, setAgentName] = useState("");
   const [agentEndpoint, setAgentEndpoint] = useState("");
+  const [proofDisclaimer, setProofDisclaimer] = useState("");
   const [regStatus, setRegStatus] = useState(null);
   const [registering, setRegistering] = useState(false);
   const [starting, setStarting] = useState(false);
@@ -121,7 +123,7 @@ export default function Home() {
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch(API.TEST_HISTORY);
+        const res = await fetch(API.TEST_HISTORY, { credentials: 'include' });
         if (!res.ok) throw new Error("bad response");
         const data = await res.json();
         const rows = Array.isArray(data)
@@ -153,7 +155,12 @@ export default function Home() {
       if (!sessionId) return;
 
       try {
-        const res = await fetch(API.STATUS(sessionId));
+        // NEW — note: status endpoint also needs the Bearer token; preferred path is
+// to call getStatus(sessionId) from api.js. Minimum-change form:
+const res = await fetch(API.STATUS(sessionId), {
+  credentials: 'include',
+  headers: { Authorization: `Bearer ${JSON.parse(sessionStorage.getItem('gridvet_session_tokens') || '{}')[sessionId] || ''}` },
+});
         if (!res.ok) throw new Error("bad status");
         const data = await res.json();
         const next = data.status;
@@ -202,20 +209,20 @@ export default function Home() {
     setCardLoading(true);
     setCardError("");
     try {
-      const reportRes = await fetch(API.REPORT(sessionId));
+      const reportRes = await fetch(API.REPORT(sessionId), {
+  credentials: 'include',
+  headers: { Authorization: `Bearer ${/* same as above */ ''}` },
+});
       if (!reportRes.ok) throw new Error("Failed to fetch report");
       const report = await reportRes.json();
       setReportData(report);
 
       const cardRes = await fetch(API.GENERATE_REPORT_CARD, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          report: report,
-          // FIX (#3): read latest agent name from ref
-          agent_name: agentNameRef.current || "Agent",
-        }),
-      });
+  method: "POST",
+  credentials: "include",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ report, agent_name: agentNameRef.current || "Agent" }),
+});
       const cardData = await cardRes.json();
       setNarrative(cardData.narrative || "");
     } catch (err) {
@@ -225,33 +232,66 @@ export default function Home() {
     }
   }
 
-  function downloadReport() {
-    const rawMasterText = reportData?.raw_master_text;
-    const sessionKey = reportData?.report_id;
-
-    if (!rawMasterText || !sessionKey) {
-      console.error("Missing raw_master_text or report_id");
-      return;
-    }
-
-    const blob = new Blob([rawMasterText], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${sessionKey}.txt`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  async function downloadReport() {
+  const sessionId = sessionStorage.getItem("gridvet_session_id");
+  if (!sessionId) {
+    setCardError("Session missing. Please re-register the agent.");
+    return;
   }
+  // Pull bearer token the same way api.js does.
+  let token = "";
+  try {
+    token = (JSON.parse(sessionStorage.getItem("gridvet_session_tokens") || "{}"))[sessionId] || "";
+  } catch {}
+  if (!token) {
+    setCardError("Session token missing. Please re-register the agent.");
+    return;
+  }
+
+  const url = `${BASE_URL}/download-report/${sessionId}?token=${encodeURIComponent(token)}`;
+  let res;
+  try {
+    res = await fetch(url, { credentials: "include" });
+  } catch (e) {
+    setCardError("Network error while downloading report.");
+    return;
+  }
+
+  if (res.status === 410) {
+    setCardError("This report was already downloaded. Re-run the test to obtain a fresh signed report.");
+    setReportData((prev) => prev ? { ...prev, downloaded: true, raw_master_text: null } : prev);
+    return;
+  }
+  if (!res.ok) {
+    setCardError(`Download failed: ${res.status}`);
+    return;
+  }
+
+  const blob = await res.blob();
+  const blobUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = blobUrl;
+  a.download = `${sessionId}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(blobUrl);
+
+  // Lock the UI — second click will 410 anyway.
+  setReportData((prev) => prev ? { ...prev, downloaded: true, raw_master_text: null } : prev);
+}
 
   const handleRegister = async () => {
     if (!agentName || !agentEndpoint) {
       setRegStatus({ ok: false, message: "Please fill in both fields." });
       return;
     }
+    if (data.proof_disclaimer) {
+    setProofDisclaimer(data.proof_disclaimer);
+    }
     setRegistering(true);
     setRegStatus(null);
+    
     try {
       const res = await fetch(API.REGISTER_AGENT, {
         method: "POST",
@@ -455,6 +495,16 @@ function renderRegistrationCard({
           onBlur={(e) => (e.target.style.borderColor = "var(--border)")}
         />
       </div>
+
+      {proofDisclaimer && (
+  <div style={{ marginTop: 14, padding: "10px 14px", borderRadius: 6,
+                background: "rgba(201,168,76,0.08)",
+                border: "1px solid var(--gold-dim)",
+                color: "var(--text-secondary)", fontSize: 12,
+                fontFamily: "Inter, sans-serif", lineHeight: 1.5 }}>
+    {proofDisclaimer}
+  </div>
+)}
 
       <button
         onClick={handleRegister}
@@ -839,7 +889,8 @@ function renderCompletedReportCard({
   const isIncomplete = adv.is_incomplete === true;
   const packetsProcessed = adv.packets_processed ?? adv.total_packets_processed ?? 0;
   const packetsPlanned = adv.packets_planned ?? adv.total_packets_processed ?? 0;
-
+  const downloaded = reportData?.downloaded === true;
+  const disclaimer = reportData?.proof_disclaimer || "";
   const divider = { height: 1, background: "var(--border-subtle)", margin: "18px 0" };
   const sectionLabel = { color: "var(--text-secondary)", fontFamily: "Inter, sans-serif", fontWeight: 500, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 8 };
 
@@ -910,11 +961,26 @@ function renderCompletedReportCard({
         </div>
       </div>
 
-      <div style={{ marginTop: 24 }}>
-        <button onClick={downloadReport} className="btn-outline-gold" style={{ width: "100%" }}>
-          Download Report
-        </button>
-      </div>
+     <div style={{ marginTop: 24 }}>
+  <button
+    onClick={downloadReport}
+    disabled={downloaded}
+    className="btn-outline-gold"
+    style={{ width: "100%", opacity: downloaded ? 0.5 : 1, cursor: downloaded ? "not-allowed" : "pointer" }}
+  >
+    {downloaded ? "Already Downloaded" : "Download Report"}
+  </button>
+  {disclaimer && (
+    <div style={{ marginTop: 10, fontSize: 11, lineHeight: 1.5,
+                  color: downloaded ? "var(--amber)" : "var(--text-secondary)",
+                  fontFamily: "Inter, sans-serif" }}>
+      {downloaded
+        ? "This was your only copy — keep it safe. The server has discarded the signed report."
+        : disclaimer}
+    </div>
+  )}
+</div>
+
     </div>
   );
 }

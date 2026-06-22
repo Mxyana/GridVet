@@ -158,7 +158,11 @@ export default function LiveTest() {
     let gotTerminalEvent = false;
 
     try {
-      source = new EventSource(API.STREAM(sessionId));
+      // NEW — also needs the token query param (line 161 silently relies on a
+// header-less call that the hardened backend will reject).
+// Use openStream() from api.js:
+import { openStream, stopTest as apiStopTest } from "../constants/api.js";
+source = openStream(sessionId);
 
       source.onopen = () =>
         setStatus((p) =>
@@ -234,7 +238,7 @@ export default function LiveTest() {
     }
 
     try {
-      const res = await fetch(API.STOP_TEST(sessionId), { method: "POST" });
+      await apiStopTest(sessionId);
       if (!res.ok) throw new Error("stop failed");
       setStatus("STOPPED");
       setStopMsg({

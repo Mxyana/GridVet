@@ -51,7 +51,8 @@ export default function Results() {
 
     (async () => {
       try {
-        const res = await fetch(API.REPORT(sessionId));
+        import { getReport } from "../constants/api.js";
+const data = await getReport(sessionId);   // throws on non-2xx; wrap accordingly
         if (!res.ok) throw new Error("bad response");
         const data = await res.json();
         if (cancelled) return;
@@ -140,6 +141,8 @@ export default function Results() {
     );
   }
 
+  const downloaded = report.downloaded === true;
+  const disclaimer = report.proof_disclaimer || "";
   const agentReport = report.agent_report || report;
   const advanced = report.advanced || {};
   const perPacketLog = advanced.per_packet_log || report.per_packet_log || [];
@@ -187,6 +190,18 @@ export default function Results() {
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto" }}>
       {Header}
+
+      {disclaimer && (
+  <div style={{ marginBottom: 16, padding: "10px 14px", borderRadius: 6,
+                background: downloaded ? "rgba(234,179,8,0.10)" : "rgba(201,168,76,0.08)",
+                border: `1px solid ${downloaded ? "rgba(234,179,8,0.5)" : "var(--gold-dim)"}`,
+                color: "var(--text-secondary)", fontSize: 12,
+                fontFamily: "Inter, sans-serif", lineHeight: 1.5 }}>
+    {downloaded
+      ? "Signed report already downloaded — keep your saved file safe."
+      : disclaimer}
+  </div>
+)}
 
       {isIncomplete && (
         <div style={{ marginBottom: 16, padding: "12px 16px", borderRadius: 8, background: "rgba(239,68,68,0.10)", border: "1px solid rgba(239,68,68,0.45)", display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
