@@ -24,6 +24,7 @@ v3 adds:
 """
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import ipaddress
@@ -42,9 +43,9 @@ from urllib.parse import urlparse
 
 import requests
 from upstash_redis import Redis
-from fastapi import FastAPI, Header, HTTPException, Query, UploadFile, File
+from fastapi import Cookie, FastAPI, Header, HTTPException, Query, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Literal
 
@@ -96,6 +97,57 @@ TARGET_OVERRIDE_NETWORKS = [
     ipaddress.ip_network(c, strict=False) for c in _extra_cidrs
 ]
 
+# ── Client-identity signing ─────────────────────────────────────────────────
+# A self-asserted X-Client-Id header lets a broken (or malicious) frontend
+# share one ID across every user, which means everyone reads everyone else's
+# run history. Defense-in-depth: the server now mints client IDs itself, signs
+# them with HMAC-SHA256, and (for browsers) ships them back as an HttpOnly
+# cookie so the page JS literally cannot read or override the value. CLI /
+# mobile clients receive the signed token in the /register-agent response
+# body and echo it via X-Client-Id. Either way, the server only ever trusts
+# tokens whose HMAC verifies.
+#
+# Persist SESSION_SECRET across restarts in production. If it's missing we
+# generate a random 32-byte secret at startup, which is safe but invalidates
+# every previously-issued cookie/token on every restart.
+_session_secret_env = os.getenv("SESSION_SECRET", "").strip()
+if _session_secret_env:
+    SESSION_SECRET = _session_secret_env.encode("utf-8")
+else:
+    SESSION_SECRET = secrets.token_bytes(32)
+
+
+def _sign_client_id(raw_cid: str) -> str:
+    """Return ``<raw_cid>.<base64url(hmac_sha256(raw_cid))>``."""
+    mac = hmac.new(SESSION_SECRET, raw_cid.encode("utf-8"), hashlib.sha256).digest()
+    sig = base64.urlsafe_b64encode(mac).rstrip(b"=").decode("ascii")
+    return f"{raw_cid}.{sig}"
+
+
+def _verify_client_id(signed: Optional[str]) -> Optional[str]:
+    """
+    Validate a signed client token. Returns the raw client_id if the HMAC
+    matches, otherwise None. Constant-time comparison via hmac.compare_digest.
+    """
+    if not signed or "." not in signed:
+        return None
+    raw_cid, _, sig = signed.rpartition(".")
+    if not raw_cid or not sig:
+        return None
+    expected = _sign_client_id(raw_cid).rpartition(".")[2]
+    if hmac.compare_digest(sig, expected):
+        return raw_cid
+    return None
+
+
+# Cookie config — HttpOnly so page JS can't read it; SameSite=Lax so it's
+# still sent on top-level navigations (Strict would break some redirect
+# flows). Secure is on in production; relaxed during local dev where the
+# server runs over http.
+CLIENT_COOKIE_NAME    = "gridvet_cid"
+CLIENT_COOKIE_MAX_AGE = 60 * 60 * 24 * 365   # 1 year
+CLIENT_COOKIE_SECURE  = os.getenv("SANDBOX_ALLOW_INTERNAL_TARGETS", "").lower() not in ("1", "true", "yes")
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -136,6 +188,12 @@ async def _lifespan(app: FastAPI):
     logger.info("Loaded %d payloads from BTC_USDT_PAYLOADS", len(BTC_USDT_PAYLOADS))
     logger.info("Tier config: %s", TIER_PACKETS)
     logger.info("CORS origins: %s (credentials=%s)", CORS_ORIGINS, CORS_ALLOW_CREDENTIALS)
+    if not _session_secret_env:
+        logger.warning(
+            "SESSION_SECRET env var not set — using an ephemeral random secret. "
+            "Every previously-issued client cookie/token will be invalidated on "
+            "the next restart. Set SESSION_SECRET in production."
+        )
     if SANDBOX_ALLOW_INTERNAL_TARGETS:
         logger.warning(
             "SANDBOX_ALLOW_INTERNAL_TARGETS is ON — private/loopback targets "
@@ -343,6 +401,13 @@ class SessionState:
     latest_master_report: Optional[str]  = None
     latest_verification:  Optional[dict] = None
 
+    # One-shot proof gate. Flips to True the first time /download-report
+    # serves the canonical .txt file. After that, /download-report refuses
+    # to re-issue it AND /report stops returning raw_master_text — the only
+    # remaining valid proof is the file the user already downloaded. Lose
+    # it or tamper with it and you must re-run the test.
+    report_downloaded: bool = False
+
     sse_queue: asyncio.Queue = field(
         default_factory=lambda: asyncio.Queue(maxsize=SSE_QUEUE_MAX)
     )
@@ -432,6 +497,7 @@ _PERSISTENT_FIELDS = (
     "agent_name", "agent_endpoint", "timestamp_ms",
     "status", "stop_requested", "packets_planned",
     "latest_master_report", "latest_verification",
+    "report_downloaded",
 )
 
 
@@ -505,6 +571,7 @@ def _hydrate_session_from_redis(session_id: str) -> Optional[SessionState]:
     sess.packets_planned      = int(data.get("packets_planned") or 0)
     sess.latest_master_report = data.get("latest_master_report")
     sess.latest_verification  = data.get("latest_verification")
+    sess.report_downloaded    = bool(data.get("report_downloaded", False))
 
     _SESSIONS[session_id] = sess
     # Re-write the (possibly status-coerced) blob so a second restart
@@ -553,27 +620,35 @@ def _new_session(agent_name: str, agent_endpoint: str, client_id: str) -> Sessio
     return sess
 
 
-def _resolve_client_id(header_value: Optional[str]) -> str:
+def _resolve_client_id(
+    cookie_value: Optional[str],
+    header_value: Optional[str],
+) -> tuple[str, str, bool]:
     """
-    Normalize a client-supplied X-Client-Id header.
+    Resolve the calling client's identity.
 
-    The browser is expected to generate a high-entropy value once
-    (e.g. crypto.randomUUID()) and persist it in localStorage. We accept
-    anything between 8 and 128 chars of URL-safe characters so different
-    clients (CLI, mobile, etc.) can adopt their own ID schemes.
+    Inputs (checked in this order):
+      1. ``gridvet_cid`` HttpOnly cookie (browsers).
+      2. ``X-Client-Id`` header (CLI / mobile).
 
-    If the header is missing or malformed we mint a fresh one — but the
-    caller will only receive it via the /register-agent response, so the
-    browser MUST capture it from there on first registration. Without a
-    matching client_id later, history lookups return an empty list.
+    Each candidate is HMAC-verified. The FIRST valid one wins. If neither is
+    valid we mint a fresh raw client_id, sign it, and the caller is expected
+    to (a) set the cookie on the response (browsers) and (b) return the
+    signed token in the JSON body so non-browser clients can persist it.
+
+    Returns ``(raw_client_id, signed_token, is_new)``.
+
+    Self-asserted, unsigned client IDs are no longer accepted — that was the
+    bug that let a frontend hardcoding ``X-Client-Id: default`` collapse every
+    user's history into one shared bucket.
     """
-    if header_value:
-        candidate = header_value.strip()
-        if 8 <= len(candidate) <= 128 and all(
-            c.isalnum() or c in "-_." for c in candidate
-        ):
-            return candidate
-    return secrets.token_urlsafe(24)
+    for candidate in (cookie_value, header_value):
+        verified = _verify_client_id(candidate.strip() if candidate else None)
+        if verified:
+            return verified, candidate.strip(), False
+
+    raw_cid = secrets.token_urlsafe(24)
+    return raw_cid, _sign_client_id(raw_cid), True
 
 
 def _get_session(session_id: str) -> SessionState:
@@ -1268,6 +1343,8 @@ async def run_pipeline(
 @app.post("/register-agent")
 async def register_agent(
     req: RegisterAgentRequest,
+    response: Response,
+    gridvet_cid: Optional[str] = Cookie(default=None, alias=CLIENT_COOKIE_NAME),
     x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id"),
 ) -> dict:
     """
@@ -1277,34 +1354,56 @@ async def register_agent(
     Returns:
       - session_id    — routing key / report filename stem
       - session_token — bearer token for every session-scoped call (shown ONCE)
-      - client_id     — opaque per-browser identifier; scopes /test-history.
-                        The browser should generate this once (e.g.
-                        crypto.randomUUID()), persist it in localStorage,
-                        and send it as `X-Client-Id` on every subsequent
-                        /register-agent and /test-history call. If omitted,
-                        the server mints one; the browser MUST capture it
-                        from this response or it will lose access to its
-                        own run history.
+      - client_id     — HMAC-SIGNED token. Browsers receive this automatically
+                        via the ``gridvet_cid`` HttpOnly cookie (page JS cannot
+                        read or override it). CLI / mobile clients MUST persist
+                        the returned value and echo it back as ``X-Client-Id``
+                        on every /test-history call. Self-asserted unsigned
+                        IDs are rejected — the server only trusts tokens it
+                        signed itself, which prevents a broken frontend from
+                        collapsing every user's history into one shared bucket.
     """
     _validate_target_url(req.agent_endpoint)
 
-    client_id = _resolve_client_id(x_client_id)
-    sess = _new_session(req.agent_name, req.agent_endpoint, client_id)
+    raw_cid, signed_cid, _is_new = _resolve_client_id(gridvet_cid, x_client_id)
+    sess = _new_session(req.agent_name, req.agent_endpoint, raw_cid)
+
+    # Always refresh the cookie (rolling expiry, sticks even for returning
+    # clients). HttpOnly so JS can't read it; SameSite=Lax so it still rides
+    # along on top-level requests from your own origin.
+    response.set_cookie(
+        key      = CLIENT_COOKIE_NAME,
+        value    = signed_cid,
+        max_age  = CLIENT_COOKIE_MAX_AGE,
+        httponly = True,
+        secure   = CLIENT_COOKIE_SECURE,
+        samesite = "lax",
+    )
 
     return {
         "status":          "ok",
         "session_id":      sess.session_id,
         "session_token":   sess.session_token,   # show ONCE
-        "client_id":       sess.client_id,       # browser must persist
+        "client_id":       signed_cid,           # signed; CLI must persist
         "agent_name":      sess.agent_name,
         "agent_endpoint":  sess.agent_endpoint,
         "report_filename": f"{sess.session_id}.txt",
         "auth_hint": (
             "Pass `Authorization: Bearer <session_token>` on every subsequent "
             "request. For /stream use `?token=<session_token>` since "
-            "EventSource cannot send custom headers. Also send "
-            "`X-Client-Id: <client_id>` on /register-agent and /test-history "
-            "to keep your run history private to this browser."
+            "EventSource cannot send custom headers. Browsers receive the "
+            "client_id automatically via an HttpOnly cookie — no action needed. "
+            "CLI/mobile clients must store the returned `client_id` and send it "
+            "as `X-Client-Id` on every /test-history call."
+        ),
+        "proof_disclaimer": (
+            "Your signed report file can be downloaded EXACTLY ONCE via "
+            "GET /download-report/{session_id}. After the first download "
+            "the server will refuse to re-issue the file — if you lose it or "
+            "edit a single byte, you must re-run the test to obtain fresh "
+            "signed proof. The original SHA-256 remains in the Redis audit "
+            "ledger forever, so anyone can verify your saved file later via "
+            "POST /verify."
         ),
     }
 
@@ -1424,32 +1523,128 @@ async def get_report(
     report["agent_name"]  = sess.agent_name
 
     verification = sess.latest_verification or {}
-    report["report_id"]       = verification.get("report_id")
-    report["secure_hash"]     = verification.get("secure_hash")
-    report["raw_master_text"] = verification.get("raw_master_text")
+    report["report_id"]   = verification.get("report_id")
+    report["secure_hash"] = verification.get("secure_hash")
+
+    # One-shot gate: raw_master_text is only included until the user
+    # downloads it. After that, the saved file is the ONLY valid proof —
+    # the server refuses to re-emit the canonical text so a tampered
+    # version cannot be quietly substituted.
+    if sess.report_downloaded:
+        report["raw_master_text"] = None
+        report["downloaded"]      = True
+        report["proof_disclaimer"] = (
+            "The signed report for this session has already been downloaded. "
+            "Re-run the test to obtain a fresh signed report — the prior file "
+            "you saved is now the only valid proof of this run."
+        )
+    else:
+        report["raw_master_text"] = verification.get("raw_master_text")
+        report["downloaded"]      = False
+        report["proof_disclaimer"] = (
+            "GET /download-report/{session_id} will serve the canonical "
+            "signed report file EXACTLY ONCE. Save it carefully — after the "
+            "first download the server will not re-issue it, and the file "
+            "you saved becomes the only valid proof."
+        )
 
     return report
 
 
+@app.get("/download-report/{session_id}")
+async def download_report(
+    session_id: str,
+    authorization: Optional[str] = Header(default=None),
+    token: Optional[str] = Query(default=None),
+):
+    """
+    One-shot canonical proof download.
+
+    Returns the signed master report as a ``text/plain`` attachment exactly
+    once per session. The second call returns 410 Gone. This is what makes
+    the disclaimer real: the user knows that the .txt file they just saved
+    is the only copy they will ever get, so they cannot rely on "I'll
+    re-download it later" — they must keep the saved artifact intact, and
+    re-run the test if they lose it or it gets edited.
+
+    Verification of the saved file via POST /verify still works forever:
+    the Redis audit ledger keeps the SHA-256 long after the master text is
+    gone from the server.
+    """
+    sess = _authorize_session(session_id, authorization, token_query=token)
+
+    if not sess.latest_master_report:
+        raise HTTPException(
+            status_code=409,
+            detail="Report is not ready yet — wait for the run to complete.",
+        )
+
+    if sess.report_downloaded:
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "This report has already been downloaded. The file you saved "
+                "previously is the only valid proof — re-run the test to "
+                "obtain a fresh signed report."
+            ),
+        )
+
+    sess.report_downloaded = True
+    _persist_session(sess)
+
+    body = sess.latest_master_report
+    logger.info("DOWNLOAD — one-shot report served for session=%s", session_id)
+
+    return PlainTextResponse(
+        body,
+        headers={
+            "Content-Disposition": f'attachment; filename="{session_id}.txt"',
+            "X-Proof-Disclaimer":
+                "ONE_SHOT_DOWNLOAD — server will not re-issue this file; "
+                "verify your saved copy via POST /verify.",
+        },
+    )
+
+
 @app.get("/test-history")
 async def test_history(
+    gridvet_cid: Optional[str] = Cookie(default=None, alias=CLIENT_COOKIE_NAME),
     x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id"),
 ) -> dict:
     """
-    Cross-run history — scoped to the calling browser via X-Client-Id.
+    Cross-run history — scoped to the calling client via signed identity.
 
-    Backed by Redis (key = run_history:<client_id>, LIST type, newest
+    Identity is read from the ``gridvet_cid`` HttpOnly cookie (browsers) or
+    ``X-Client-Id`` header (CLI/mobile). Both must be HMAC-SIGNED tokens
+    that the server issued from /register-agent — self-asserted strings are
+    rejected. This prevents a broken frontend from hardcoding the same ID
+    for every user, which was previously collapsing every customer's runs
+    into one shared list.
+
+    Backed by Redis (key = run_history:<raw_client_id>, LIST type, newest
     first). Per-client isolation is enforced at the key level: there is
     no shared blob to filter, so one client cannot read another's rows
-    even if X-Client-Id is guessed — the worst case is reading an empty
-    list for a key that doesn't exist.
+    even if the signing secret were compromised — a forged token would
+    still resolve to its own bucket, not someone else's.
     """
-    if not x_client_id:
+    presented = gridvet_cid or x_client_id
+    if not presented:
         raise HTTPException(
-            status_code=400,
+            status_code=401,
             detail=(
-                "Missing X-Client-Id header. Register an agent first to "
-                "obtain a client_id, then send it on every /test-history call."
+                "No client identity presented. Call /register-agent first — "
+                "browsers will receive a cookie automatically; CLI clients "
+                "must echo the returned `client_id` as `X-Client-Id`."
+            ),
+        )
+
+    raw_cid = _verify_client_id(presented.strip())
+    if not raw_cid:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Invalid or unsigned client token. Re-register via "
+                "/register-agent to obtain a fresh signed identity."
             ),
         )
 
@@ -1460,7 +1655,7 @@ async def test_history(
             "message": "Run-history backend unavailable (Redis not configured).",
         }
 
-    key = _history_key(x_client_id)
+    key = _history_key(raw_cid)
     try:
         raw_entries = await asyncio.to_thread(redis_db.lrange, key, 0, -1)
     except Exception as exc:   # noqa: BLE001
@@ -1479,27 +1674,30 @@ async def test_history(
 
 @app.delete("/test-history")
 async def clear_test_history(
+    gridvet_cid: Optional[str] = Cookie(default=None, alias=CLIENT_COOKIE_NAME),
     x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id"),
 ) -> dict:
     """
-    Delete only the calling browser's history rows.
+    Delete only the calling client's history rows.
 
-    Simply drops the per-client Redis key. Other clients' lists live
-    under different keys and are untouched.
+    Identity verified the same way as GET /test-history (signed cookie or
+    signed header). Drops the per-client Redis key. Other clients' lists
+    live under different keys and are untouched.
     """
-    if not x_client_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing X-Client-Id header.",
-        )
+    presented = gridvet_cid or x_client_id
+    if not presented:
+        raise HTTPException(status_code=401, detail="No client identity presented.")
+
+    raw_cid = _verify_client_id(presented.strip())
+    if not raw_cid:
+        raise HTTPException(status_code=403, detail="Invalid or unsigned client token.")
 
     if redis_db is None:
         return {"status": "noop", "removed": 0, "message": "Redis unavailable."}
 
-    key = _history_key(x_client_id)
+    key = _history_key(raw_cid)
     removed = 0
     try:
-        # LLEN before DEL so we can report how many entries were dropped.
         removed = int(await asyncio.to_thread(redis_db.llen, key) or 0)
         await asyncio.to_thread(redis_db.delete, key)
     except Exception as exc:   # noqa: BLE001
@@ -1507,7 +1705,7 @@ async def clear_test_history(
 
     logger.info(
         "History cleared for client=%s… (removed %d rows)",
-        x_client_id[:8], removed,
+        raw_cid[:8], removed,
     )
     return {"status": "ok", "removed": removed}
 
