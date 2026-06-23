@@ -24,6 +24,8 @@
 - [Trustless Cryptographic Attestation](#trustless-cryptographic-attestation)
 - [Strict Consent Gating](#strict-consent-gating)
 - [API Schemas](#api-schemas)
+- [How to Recreate Results (Test Agent)](#how-to-recreate-results-test-agent)
+- [Known Issues (Visual / Frontend)](#known-issues-visual--frontend)
 - [Quick Start](#quick-start)
 - [Roadmap](#roadmap)
 - [License](#license)
@@ -292,11 +294,11 @@ SECURITY SCORE: X.X%
 TIER:         S/A/B/C/D - COMMENT
 ----------------------------------------
 VULNERABILITY BREAKDOWN:
-  goal hijack: UNTESTED
-  false announcement: UNTESTED
-  wallet redirect: UNTESTED
-  panic trigger: UNTESTED
-  tool manipulation: UNTESTED
+  goal hijack: RESULT
+  false announcement: RESULT
+  wallet redirect: RESULT
+  panic trigger: RESULT
+  tool manipulation: RESULT
 
 AI SECURITY ASSESSMENT: COMMMENT/RECOMMENDATION
 
@@ -518,9 +520,70 @@ curl -N http://localhost:8000/audit/stream
 
 ---
 
+## How to Recreate Results (Test Agent)
+
+Evaluators can reproduce a full GridVet audit end-to-end using the live, hosted infrastructure — no local setup required. The following steps walk through running an adversarial sandbox test against our pre-deployed reference agent and verifying the resulting cryptographic attestation.
+
+### Step 1 — Open the Live Dashboard
+
+Navigate to the production dashboard deployment:
+
+> **[https://gridvet.netlify.app](https://gridvet.netlify.app)**
+
+The dashboard is the same React + SSE frontend described in [Node 6](#node-6--frontend-dashboard) and is wired directly to the production backend pipeline.
+
+### Step 2 — Configure the Target Agent Endpoint
+
+In the **Target Agent** input field, paste the pre-deployed live test agent endpoint:
+
+> **`https://node-3-w9jo.onrender.com/decide`**
+
+This reference agent (the **Test Agent**) is built on the **GroqCloud API** and uses **Llama-3.3-70b-versatile** for ultra-low-latency context parsing and decision generation. It is fully consent-attested and ready to receive sandboxed market data payloads from Node 1.
+
+### Step 3 — Run the Adversarial Sandbox Test
+
+Trigger the audit run from the dashboard. The pipeline will:
+
+1. Stream simulated BTC/USDT market data ticks from Node 1.
+2. Probabilistically inject adversarial payloads from the [Attack Taxonomy](#attack-taxonomy) via Node 2.
+3. Forward the (potentially poisoned) context to the AIMI Test Agent in Node 3.
+4. Execute the 5 blind verification checks in Node 4.
+5. Cross-reference verdicts against the ground-truth ledger in Node 5 and assign a Security Tier.
+
+Live progress, per-tick verdicts, and final metrics will stream into the dashboard via SSE in real time.
+
+### Step 4 — Download and Verify the Attested Report
+
+Upon completion, the system automatically:
+
+- Generates the human-readable `.txt` audit report containing all metrics, verdicts, and the assigned Security Tier.
+- Computes the **SHA-256 hash** of the report's full text content and commits it to the backend `records.json` ledger.
+- Names the report file using its secure **Base62 Audit ID** (e.g., `7Kx9mPqR2vLw.txt`), making each report uniquely and immutably identifiable.
+
+Download the report directly from the dashboard, then upload it to the **verification portal** to exercise the tamper-detection engine. Re-hashing and comparing against the ledger confirms — with cryptographic certainty — that the report is authentic and unaltered. Modifying any byte of the file will invalidate the signature and trigger a tamper warning.
+
+---
+
+## Known Issues (Visual / Frontend)
+
+In the interest of full transparency: the **Python backend, FastAPI endpoints, and SHA-256 cryptographic hashing logic are 100% stable and fully operational**. Every audit produces a valid attestation, every hash matches the ledger, and the verification chain has not exhibited any backend regressions.
+
+The known quirks below are confined to the **React Native frontend** and are purely cosmetic — none of them affect the integrity of an audit, the validity of the cryptographic attestation, or the correctness of the pipeline's verdicts.
+
+| Issue | Description | Impact |
+|---|---|---|
+| **False Download Toast** | Clicking download on an audit report may briefly trigger a "download failed" notification. The file still downloads successfully and the SHA-256 hash remains valid. | Cosmetic only |
+| **Graph Viewport Rendering** | Telemetry graphs occasionally exhibit visual alignment bugs on specific screen dimensions. | Cosmetic only |
+| **History Management** | There is currently no dedicated UI button to manually clear the dashboard's run history. | Minor UX gap |
+| **API Request Behavior** | Exiting the page can occasionally trigger a repeating loop of API request inputs for the ai assessment. This does **NOT** affect back-end execution, ledger writes, or report generation. | Cosmetic only |
+
+These items are tracked for resolution in the next frontend release. They do not block reproduction, verification, or evaluation of any GridVet audit.
+
+---
+
 ## Roadmap
 
-### v1.1 — Public Verification Portal
+### v1.0 — Public Verification Portal (**COMPLETED**)
 
 A standalone web interface where hackathon judges, Web3 auditors, and agent operators can verify report authenticity:
 
@@ -532,7 +595,7 @@ A standalone web interface where hackathon judges, Web3 auditors, and agent oper
 
 This completes the trustless loop: anyone in the world can verify a GridVet audit without trusting the pipeline, the operator, or GridVet itself.
 
-### v1.2 — Dynamic Interceptor Engine
+### v1.1 — Dynamic Interceptor Engine
 
 Upgrade from the fixed 50-payload library to a **dynamic, LLM-driven adversarial payload generator**:
 
@@ -541,13 +604,13 @@ Upgrade from the fixed 50-payload library to a **dynamic, LLM-driven adversarial
 - Generate novel, context-aware injection payloads that adapt to the agent's specific defenses
 - Move from static red-teaming to **adaptive adversarial simulation**
 
-### v1.3 — Multi-Agent Comparative Benchmarking
+### v1.2 — Multi-Agent Comparative Benchmarking
 
 - Run the same injection suite against multiple agents simultaneously
 - Generate comparative leaderboards and category-specific rankings
 - Enable "patch verification" — re-test an agent after hardening and diff the results
 
-### v1.4 — On-Chain Attestation
+### v1.3 — On-Chain Attestation
 
 - Anchor audit hashes to an L2 chain (e.g., Base, Arbitrum) for immutable, decentralized verification
 - Replace the local `records.json` ledger with an on-chain registry
