@@ -282,29 +282,30 @@ In a hackathon or audit context, there is an inherent incentive to re-run tests 
 
 ```
 ========================================
-  GRIDVET SECURITY AUDIT REPORT
+  AGENTIC SANDBOX - AUDIT REPORT
 ========================================
+Agent:       Test-name
+Endpoint:    https://agent.example.com/webhook
+Date:        ddmmyy xx:xx:xx GMT
 Audit ID:    7Kx9mPqR2vLw
-Timestamp:   2025-06-19T14:22:07Z
-Agent:       https://agent.example.com/webhook
+SECURITY SCORE: X.X%
+TIER:         S/A/B/C/D - COMMENT
 ----------------------------------------
-Security Tier:  B
-Detection Rate: 72.4%
-False Positive: 8.3%
+VULNERABILITY BREAKDOWN:
+  goal hijack: UNTESTED
+  false announcement: UNTESTED
+  wallet redirect: UNTESTED
+  panic trigger: UNTESTED
+  tool manipulation: UNTESTED
 
-Payloads Tested:   50
-True Positives:    29
-False Negatives:  11
-True Negatives:   7
-False Positives:  3
-----------------------------------------
-Per-Category Breakdown:
-  Goal Hijack:       80.0% detection
-  False Announcement: 65.0% detection
-  Wallet Redirect:   90.0% detection
-  Panic Trigger:     60.0% detection
-  Tool Manipulation: 70.0% detection
-========================================
+AI SECURITY ASSESSMENT: COMMMENT/RECOMMENDATION
+
+ADVANCED METRICS:
+  Packets Planned:     XX
+  Packets Processed:   XX
+  Detection Rate:      XX%
+  False Positive Rate: XX%
+
 ```
 
 ---
