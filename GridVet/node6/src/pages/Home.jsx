@@ -92,6 +92,10 @@ const TEST_MODES = [
   { key: "Benchmark", description: "Fixed seed — deterministic, comparable runs." },
 ];
 
+// Cache key helpers — keep session-scoped so multiple runs don't collide.
+const doneKey = (sid) => `gridvet_done_${sid}`;
+const reportKey = (sid) => `gridvet_report_${sid}`;
+
 export default function Home() {
   const navigate = useNavigate();
 
@@ -160,11 +164,7 @@ export default function Home() {
       if (!sessionId) return;
 
       try {
-        // NEW — note: status endpoint also needs the Bearer token; preferred path is
-// to call getStatus(sessionId) from api.js. Minimum-change form:
-
         const data = await getStatus(sessionId);
-
         const next = data?.status;
 
         setTestStatus((prev) => (prev !== next ? next : prev));
@@ -176,6 +176,10 @@ export default function Home() {
               clearInterval(pollRef.current);
               pollRef.current = null;
             }
+            // Mark this session as terminal so future mounts don't re-poll.
+            try {
+              sessionStorage.setItem(doneKey(sessionId), next);
+            } catch {}
             fetchReportAndGenerate(sessionId);
           }
         } else if (next === "ERROR") {
@@ -183,6 +187,9 @@ export default function Home() {
             clearInterval(pollRef.current);
             pollRef.current = null;
           }
+          try {
+            sessionStorage.setItem(doneKey(sessionId), "ERROR");
+          } catch {}
         }
       } catch (err) {
         // Transient network errors — the next tick will retry.
@@ -190,11 +197,24 @@ export default function Home() {
     }, 3000);
   }, []);
 
-  // Start polling on mount in case a test was already in flight (e.g. page refresh)
+  // Decide on mount: do nothing / hydrate from cache / start polling.
   useEffect(() => {
-    if (sessionStorage.getItem("gridvet_session_id")) {
-      startPolling();
+    const sessionId = sessionStorage.getItem("gridvet_session_id");
+    if (!sessionId) return;
+
+    const doneStatus = sessionStorage.getItem(doneKey(sessionId));
+    if (doneStatus) {
+      // Already finished — hydrate UI from cache only, never re-poll or regenerate.
+      if (doneStatus === "COMPLETE" || doneStatus === "STOPPED") {
+        setTestStatus(doneStatus);
+        fetchReportAndGenerate(sessionId);
+      } else {
+        setTestStatus(doneStatus);
+      }
+      return;
     }
+
+    startPolling();
     return () => {
       if (pollRef.current) {
         clearInterval(pollRef.current);
@@ -208,20 +228,44 @@ export default function Home() {
       setCardError("Session missing. Please re-register the agent.");
       return;
     }
+
+    // Hydrate from sessionStorage cache if we already paid for this report.
+    try {
+      const cachedRaw = sessionStorage.getItem(reportKey(sessionId));
+      if (cachedRaw) {
+        const cached = JSON.parse(cachedRaw);
+        if (cached?.report) {
+          setReportData(cached.report);
+          setNarrative(cached.narrative || "");
+          setCardLoading(false);
+          setCardError("");
+          return;
+        }
+      }
+    } catch {
+      // Fall through to network on parse error.
+    }
+
     setCardLoading(true);
     setCardError("");
     try {
       const report = await getReport(sessionId);
-setReportData(report);
-      
-      
-      
-      const cardData = await generateReportCard({
-  report,
-  agent_name: agentNameRef.current || "Agent",
-});
+      setReportData(report);
 
-      setNarrative(cardData?.narrative || "");
+      const cardData = await generateReportCard({
+        report,
+        agent_name: agentNameRef.current || "Agent",
+      });
+      const narrativeText = cardData?.narrative || "";
+      setNarrative(narrativeText);
+
+      // Cache so future page mounts don't re-hit getReport / generateReportCard.
+      try {
+        sessionStorage.setItem(
+          reportKey(sessionId),
+          JSON.stringify({ report, narrative: narrativeText })
+        );
+      } catch {}
     } catch (err) {
       setCardError("Failed to generate report card.");
     } finally {
@@ -230,59 +274,71 @@ setReportData(report);
   }
 
   async function downloadReport() {
-  const sessionId = sessionStorage.getItem("gridvet_session_id");
-  if (!sessionId) { setCardError("No active session."); return; }
-  const result = await downloadReportApi(sessionId);
+    const sessionId = sessionStorage.getItem("gridvet_session_id");
+    if (!sessionId) { setCardError("No active session."); return; }
+    const result = await downloadReportApi(sessionId);
 
-if (result.alreadyDownloaded) {
-  setCardError(
-    "This report was already downloaded. Re-run the test to obtain a fresh signed report."
-  );
+    if (result.alreadyDownloaded) {
+      setCardError(
+        "This report was already downloaded. Re-run the test to obtain a fresh signed report."
+      );
 
-  setReportData((prev) =>
-    prev
-      ? {
-          ...prev,
-          downloaded: true,
-          raw_master_text: null,
-        }
-      : prev
-  );
+      setReportData((prev) =>
+        prev
+          ? {
+              ...prev,
+              downloaded: true,
+              raw_master_text: null,
+            }
+          : prev
+      );
 
-  return;
-}
-  const url = `${BASE_URL}/download-report/${sessionId}?token=${encodeURIComponent(result.token)}`;
-  let res;
-  try {
-    res = await fetch(url, { credentials: "include" });
-  } catch (e) {
-    setCardError("Network error while downloading report.");
-    return;
-  }
+      return;
+    }
+    const url = `${BASE_URL}/download-report/${sessionId}?token=${encodeURIComponent(result.token)}`;
+    let res;
+    try {
+      res = await fetch(url, { credentials: "include" });
+    } catch (e) {
+      setCardError("Network error while downloading report.");
+      return;
+    }
 
-  if (res.status === 410) {
-    setCardError("This report was already downloaded. Re-run the test to obtain a fresh signed report.");
+    if (res.status === 410) {
+      setCardError("This report was already downloaded. Re-run the test to obtain a fresh signed report.");
+      setReportData((prev) => prev ? { ...prev, downloaded: true, raw_master_text: null } : prev);
+      return;
+    }
+    if (!res.ok) {
+      setCardError(`Download failed: ${res.status}`);
+      return;
+    }
+
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = blobUrl;
+    a.download = `${sessionId}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(blobUrl);
+
+    // Lock the UI — second click will 410 anyway.
     setReportData((prev) => prev ? { ...prev, downloaded: true, raw_master_text: null } : prev);
-    return;
-  }
-  if (!res.ok) {
-    setCardError(`Download failed: ${res.status}`);
-    return;
-  }
 
-  const blob = await res.blob();
-  const blobUrl = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = blobUrl;
-  a.download = `${sessionId}.txt`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(blobUrl);
-
-  // Lock the UI — second click will 410 anyway.
-  setReportData((prev) => prev ? { ...prev, downloaded: true, raw_master_text: null } : prev);
-}
+    // Keep cache consistent with the locked state so a remount shows the same UI.
+    try {
+      const cachedRaw = sessionStorage.getItem(reportKey(sessionId));
+      if (cachedRaw) {
+        const cached = JSON.parse(cachedRaw);
+        if (cached?.report) {
+          cached.report = { ...cached.report, downloaded: true, raw_master_text: null };
+          sessionStorage.setItem(reportKey(sessionId), JSON.stringify(cached));
+        }
+      }
+    } catch {}
+  }
 
   const handleRegister = async () => {
     if (!agentName || !agentEndpoint) {
@@ -291,16 +347,16 @@ if (result.alreadyDownloaded) {
     }
     setRegistering(true);
     setRegStatus(null);
-    
+
     try {
       const data = await registerAgent({
-  agent_name: agentName,
-  agent_endpoint: agentEndpoint,
-});
-      
+        agent_name: agentName,
+        agent_endpoint: agentEndpoint,
+      });
+
       if (data.proof_disclaimer) {
-  setProofDisclaimer(data.proof_disclaimer);
-}
+        setProofDisclaimer(data.proof_disclaimer);
+      }
 
       try {
         sessionStorage.setItem("gridvet_agent_name", agentName);
@@ -333,13 +389,19 @@ if (result.alreadyDownloaded) {
     setNarrative("");
     setCardError("");
 
+    // New run begins — clear cached done-marker & report for this session so
+    // polling re-arms and the new report can be fetched/generated exactly once.
+    try {
+      sessionStorage.removeItem(doneKey(sessionId));
+      sessionStorage.removeItem(reportKey(sessionId));
+    } catch {}
+
     try {
       await runTest({
-  session_id: sessionId,
-  tier: selectedTier,
-  mode: selectedMode,
-});
-      
+        session_id: sessionId,
+        tier: selectedTier,
+        mode: selectedMode,
+      });
 
       // FIX (#4): don't claim RUNNING on a failed request
       setTestStatus("RUNNING");
@@ -493,14 +555,14 @@ function renderRegistrationCard({
       </div>
 
       {proofDisclaimer && (
-  <div style={{ marginTop: 14, padding: "10px 14px", borderRadius: 6,
-                background: "rgba(201,168,76,0.08)",
-                border: "1px solid var(--gold-dim)",
-                color: "var(--text-secondary)", fontSize: 12,
-                fontFamily: "Inter, sans-serif", lineHeight: 1.5 }}>
-    {proofDisclaimer}
-  </div>
-)}
+        <div style={{ marginTop: 14, padding: "10px 14px", borderRadius: 6,
+                      background: "rgba(201,168,76,0.08)",
+                      border: "1px solid var(--gold-dim)",
+                      color: "var(--text-secondary)", fontSize: 12,
+                      fontFamily: "Inter, sans-serif", lineHeight: 1.5 }}>
+          {proofDisclaimer}
+        </div>
+      )}
 
       <button
         onClick={handleRegister}
@@ -957,26 +1019,25 @@ function renderCompletedReportCard({
         </div>
       </div>
 
-     <div style={{ marginTop: 24 }}>
-  <button
-    onClick={downloadReport}
-    disabled={downloaded}
-    className="btn-outline-gold"
-    style={{ width: "100%", opacity: downloaded ? 0.5 : 1, cursor: downloaded ? "not-allowed" : "pointer" }}
-  >
-    {downloaded ? "Already Downloaded" : "Download Report"}
-  </button>
-  {disclaimer && (
-    <div style={{ marginTop: 10, fontSize: 11, lineHeight: 1.5,
-                  color: downloaded ? "var(--amber)" : "var(--text-secondary)",
-                  fontFamily: "Inter, sans-serif" }}>
-      {downloaded
-        ? "This was your only copy — keep it safe. The server has discarded the signed report."
-        : disclaimer}
-    </div>
-  )}
-</div>
-
+      <div style={{ marginTop: 24 }}>
+        <button
+          onClick={downloadReport}
+          disabled={downloaded}
+          className="btn-outline-gold"
+          style={{ width: "100%", opacity: downloaded ? 0.5 : 1, cursor: downloaded ? "not-allowed" : "pointer" }}
+        >
+          {downloaded ? "Already Downloaded" : "Download Report"}
+        </button>
+        {disclaimer && (
+          <div style={{ marginTop: 10, fontSize: 11, lineHeight: 1.5,
+                        color: downloaded ? "var(--amber)" : "var(--text-secondary)",
+                        fontFamily: "Inter, sans-serif" }}>
+            {downloaded
+              ? "This was your only copy — keep it safe. The server has discarded the signed report."
+              : disclaimer}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
