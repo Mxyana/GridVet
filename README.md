@@ -637,9 +637,8 @@ The known quirks below are confined to the **React Native frontend** and are pur
 | Issue | Description | Impact |
 |---|---|---|
 | **False Download Toast** | Clicking download on an audit report may briefly trigger a "download failed" notification. The file still downloads successfully and the SHA-256 hash remains valid. | Cosmetic only |
-| **Graph Viewport Rendering** | Telemetry graphs occasionally exhibit visual alignment bugs on specific screen dimensions. | Cosmetic only |
 | **History Management** | There is currently no dedicated UI button to manually clear the dashboard's run history. | Minor UX gap |
-| **API Request Behavior** | Exiting the page can occasionally trigger a repeating loop of API request inputs for the ai assessment. This does **NOT** affect back-end execution, ledger writes, or report generation. | Cosmetic only |
+
 
 These items are tracked for resolution in the next frontend release. They do not block reproduction, verification, or evaluation of any GridVet audit.
 
