@@ -431,77 +431,129 @@ Each entry in `records.json`:
 
 ### Prerequisites
 
-- Python 3.10+
-- Node.js 18+ (for the React dashboard)
-- `pip` and `npm`
+- **Python** 3.10+
+- **Node.js** 18+ (for the React dashboard)
+- **`pip`** and **`npm`** on `$PATH`
+- **An LLM API key** for the Node 4 verification panel (and, optionally, your test agent):
+  - `OPENAI_API_KEY`, **or**
+  - `ANTHROPIC_API_KEY`
+- *(Optional)* `GROQ_API_KEY` if you want to run the reference test agent locally (Llama-3.3-70b-versatile via GroqCloud)
 
-### Backend Setup
+### 1. Clone & Install (Backend)
 
 ```bash
 # Clone the repository
 git clone https://github.com/your-org/GridVet.git
-cd gridvet
+cd GridVet/GridVet
 
-# Create and activate a virtual environment or not (virtual env is the safest route to avoid dependencies clashing)
+# Create and activate a virtual environment (recommended — avoids dependency clashes)
 python -m venv .venv
-source .venv/bin/activate  # Linux/macOS
-# .venv\Scripts\activate   # Windows
+source .venv/bin/activate    # Linux/macOS
+# .venv\Scripts\activate     # Windows
 
-# Install dependencies
+# Install Python dependencies
 pip install -r requirements.txt
 ```
 
-### Configuration
+### 2. Configuration
 
-Copy the example environment file and adjust as needed:
+Copy the example environment file and fill in your secrets:
 
 ```bash
-cp .env.example .env
+cp .env.example .env         # then edit .env and add your API keys
 ```
 
 Key configuration values:
 
 | Variable | Default | Description |
 |---|---|---|
+| `OPENAI_API_KEY` *or* `ANTHROPIC_API_KEY` | — | Powers the Node 4 blind verification panel. At least one is required. |
+| `TARGET_AGENT_URL` | `http://localhost:9000/agent/decision` | Webhook the sandbox forwards (potentially poisoned) market data to. Point this at the agent you want to audit. |
 | `INJECTION_PROBABILITY` | `0.5` | Probability (0.0–1.0) that any given tick is injected |
 | `TICK_INTERVAL_MS` | `2000` | Milliseconds between market data ticks |
 | `AGENT_TIMEOUT_MS` | `10000` | Max time to wait for agent response before timeout |
 | `LEDGER_PATH` | `./data/records.json` | Path to the cryptographic attestation ledger |
 | `INJECTION_LIBRARY` | `./payloads/library.json` | Path to the adversarial payload library |
 
-### Run the Backend
+### 3. Run the Backend
+
+You have two options:
+
+**Option A — One-shot orchestrator (simplest).** Boots Nodes 1–5 together and exposes the SSE event stream on `http://localhost:8000`:
 
 ```bash
-# Start the FastAPI server with Uvicorn
+python main.py
+```
+
+**Option B — Uvicorn directly** (useful for hot-reload during development):
+
+```bash
 uvicorn gridvet.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-The API will be available at `http://localhost:8000`. Interactive docs at `http://localhost:8000/docs`.
+The API is available at `http://localhost:8000`. Interactive OpenAPI docs at `http://localhost:8000/docs`.
 
-### Run the Frontend Dashboard
+### 4. Run the Frontend Dashboard
+
+From the repo root:
 
 ```bash
-cd frontend
+cd node6                 # React + Vite + Tailwind dashboard
 npm install
 npm run dev
 ```
 
-The dashboard connects to the backend SSE stream and will display live pipeline activity at `http://localhost:5173`.
+The dashboard runs on `http://localhost:5173` and connects to the backend SSE stream automatically — no extra wiring required.
 
-### Register a Target Agent
+### 5. Test Your Own Agent
+
+Any HTTP service that implements a single decision webhook can be audited. Stand up an endpoint that accepts the canonical market-data payload and returns a normalized decision.
+
+**Request — `POST /agent/decision`**
+
+```http
+POST /agent/decision
+Content-Type: application/json
+
+{
+  "candle":  { "ts": 1718000000, "o": 65000, "h": 65100, "l": 64900, "c": 65050, "v": 12.4 },
+  "news":    [ { "headline": "...", "source": "..." } ],
+  "onchain": [ { "event": "...", "address": "..." } ]
+}
+```
+
+**Response**
+
+```json
+{ "action": "buy" | "sell" | "hold", "size": 0.0, "reason": "..." }
+```
+
+> See [API Schemas](#api-schemas) for the full canonical schema (with `context`, `confidence`, `metadata`, etc.) that the Node 3 normalizer maps onto.
+
+Point GridVet at your agent by setting the env var in `.env`:
+
+```
+TARGET_AGENT_URL=http://localhost:9000/agent/decision
+```
+
+### 6. Register the Agent (Consent Handshake)
+
+Before the sandbox will route traffic, the operator must complete the consent attestation:
 
 ```bash
 curl -X POST http://localhost:8000/register-agent \
   -H "Content-Type: application/json" \
   -d '{
-    "agent_url": "https://your-agent.example.com/webhook",
+    "agent_url": "http://localhost:9000/agent/decision",
     "agent_name": "MyTradingBot v1.0",
     "operator_email": "dev@example.com",
     "attestation_token": "YOUR_SANDBOX_ATTESTATION_TOKEN"
   }'
 ```
 
-### Start an Audit Run
+See [Strict Consent Gating](#strict-consent-gating) for how to obtain a `SANDBOX_ATTESTATION_TOKEN`.
+
+### 7. Start an Audit Run
 
 ```bash
 curl -X POST http://localhost:8000/audit/start \
@@ -513,11 +565,13 @@ curl -X POST http://localhost:8000/audit/start \
   }'
 ```
 
-Monitor progress in real time via the SSE endpoint:
+Monitor progress in real time via the SSE endpoint (or just watch the dashboard):
 
 ```bash
 curl -N http://localhost:8000/audit/stream
 ```
+
+When the run completes, the attested `.txt` report and its Base62 Audit ID are available from the dashboard, and the SHA-256 commitment is written to `records.json`.
 
 ---
 
@@ -637,8 +691,9 @@ The known quirks below are confined to the **React Native frontend** and are pur
 | Issue | Description | Impact |
 |---|---|---|
 | **False Download Toast** | Clicking download on an audit report may briefly trigger a "download failed" notification. The file still downloads successfully and the SHA-256 hash remains valid. | Cosmetic only |
+| **Graph Viewport Rendering** | Telemetry graphs occasionally exhibit visual alignment bugs on specific screen dimensions. | Cosmetic only |
 | **History Management** | There is currently no dedicated UI button to manually clear the dashboard's run history. | Minor UX gap |
-
+| **API Request Behavior** | Exiting the page can occasionally trigger a repeating loop of API request inputs for the ai assessment. This does **NOT** affect back-end execution, ledger writes, or report generation. | Cosmetic only |
 
 These items are tracked for resolution in the next frontend release. They do not block reproduction, verification, or evaluation of any GridVet audit.
 
@@ -691,6 +746,6 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 **GridVet** — Don't Trust, Verify.
 
-Built for the Bitget Hackathon. Securing the agents that move money.
+Securing the agents that move money.
 
 </div>
