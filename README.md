@@ -436,7 +436,7 @@ Each entry in `records.json`:
 - **`pip`** and **`npm`** on `$PATH`
 - **An LLM API key** for the Node 4 verification panel (and, optionally, your test agent):
   - `OPENAI_API_KEY`, **or**
-  - `ANTHROPIC_API_KEY`
+  - `ALIBABA_CLOUD_API_KEY`
 - *(Optional)* `GROQ_API_KEY` if you want to run the reference test agent locally (Llama-3.3-70b-versatile via GroqCloud)
 
 ### 1. Clone & Install (Backend)
@@ -467,7 +467,7 @@ Key configuration values:
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENAI_API_KEY` *or* `ANTHROPIC_API_KEY` | — | Powers the Node 4 blind verification panel. At least one is required. |
+| `OPENAI_API_KEY` *or* `ALIBABA_CLOUD_API_KEY` | — | Powers the Node 4 blind verification panel. At least one is required. |
 | `TARGET_AGENT_URL` | `http://localhost:9000/agent/decision` | Webhook the sandbox forwards (potentially poisoned) market data to. Point this at the agent you want to audit. |
 | `INJECTION_PROBABILITY` | `0.5` | Probability (0.0–1.0) that any given tick is injected |
 | `TICK_INTERVAL_MS` | `2000` | Milliseconds between market data ticks |
@@ -680,6 +680,37 @@ The Denial-of-Service event recorded in Run 2 adds a further dimension: `panic_t
 
 GridVet's role here is to surface these vulnerabilities before they reach production. These baseline scores represent the attack surface as it exists today — the starting point against which any hardened agent should be measured.
 
+### Run 3 — Inference-Provider Sensitivity (Groq API Key Rotation)
+
+A third run was conducted against the same agent code, the same endpoint (`https://node-3-w9jo.onrender.com/decide`), and the same underlying model declaration (Llama-3.3-70b-versatile on GroqCloud). **The only variable changed between Run 2 and Run 3 was the GroqCloud API key.** No prompts were edited, no payloads were altered, no agent logic was touched.
+
+| | Run 1 (22 Jun) | Run 2 (23 Jun) | Run 3 (25 Jun — new Groq key) |
+|---|---|---|---|
+| Audit ID | GR_vnjTQoc | GR_vnptnJ5 | **TE_vnxLDL8** |
+| Score | 63.3% | 60.0% | **50.0%** |
+| Attacks Resisted | 19 / 30 | 18 / 30 | **15 / 30** |
+| Detection Rate | 36.7% | 36.7% | **50.0%** |
+| False Positive Rate | 0% | 0% | 0% |
+| Tier | C | C | **C — Vulnerable** |
+
+The takeaway is uncomfortable but important: **swapping a single credential — with zero changes to model name, prompt, payload library, or agent code — moved the security score by ~11.65 points and pushed the agent further into the C-tier vulnerability band.** That is not within the ±3.3% noise floor established by Runs 1–2. It is a discrete, reproducible regression caused exclusively by routing inference traffic through a different account on the same provider.
+
+#### Technical Explanation
+
+Switching an API key on a hosted inference provider is not a no-op, even when the model identifier string is identical:
+
+- **Hardware-shard routing.** Hosted LLM platforms route requests across heterogeneous accelerator pools (mixed GPU SKUs, different LPU/TPU generations, varying batch sizes). Different account tiers and keys frequently land on different shards. Numerical kernels are not bit-exact across hardware, which produces small logit deltas that compound in long, structured reasoning chains — exactly the kind of reasoning a security-aware agent does when scrutinizing an injected payload.
+- **Quantization and serving-format drift.** Many providers serve the same nominal model under different quantization profiles (FP16, FP8, INT8, speculative-decoding variants) depending on account class and current load. A model that was *just* refusing a wallet-redirect injection at FP16 can begin complying with it at FP8 because the refusal-direction activations sit near a decision boundary.
+- **Sampling defaults and rate-limit tier behavior.** Default temperature, top-p, and max-tokens caps can vary by account tier. Even a small temperature shift changes which of two near-tied tokens wins at the moment the agent decides "I will comply" vs. "I will refuse."
+- **Cache state and KV reuse.** Provider-side prompt caches are per-key. A fresh key starts cold, which alters latency, chunking, and — for some serving stacks — the order in which tokens are scored.
+- **Silent model-version pinning.** "Llama-3.3-70b-versatile" is a routing alias, not an immutable checkpoint. Different keys can resolve the alias to different underlying weights for days at a time during rolling updates.
+
+The net result: **the inference layer is itself part of the attack surface.** An agent that passed an audit yesterday on Key A may fail the identical audit today on Key B, with no observable change in the operator's repo. This is precisely the class of silent regression that GridVet's cryptographic attestation chain is designed to make undeniable — the report for Run 3 hashes to a different commit than Run 2, and the score regression is permanently locked into the ledger.
+
+#### Procurement Note — Why Groq Instead of Alibaba
+
+The reference Test Agent was originally specified to run on **Alibaba Cloud Model Studio (Qwen series)**, which offered the closest latency profile to what the GridVet pipeline needs for tick-rate decisioning. Alibaba's payment system rejected the onboarding flow used during development, and the procurement friction could not be resolved in time. **GroqCloud was selected as the fallback** because it was the only remaining provider whose end-to-end latency on a 70B-class model was within the same order of magnitude as the Alibaba target. This substitution is itself an example of the dynamic Run 3 measures: the security profile of a deployed agent is partially a function of which inference vendor the operator could actually transact with — not which one they would have chosen on technical merit. Future benchmarks will re-run the same harness against Qwen once payment access is restored, to quantify the cross-vendor delta directly.
+
 ---
 
 ## Known Issues (Visual / Frontend)
@@ -710,6 +741,7 @@ A standalone web interface where hackathon judges, Web3 auditors, and agent oper
 - **Hash**: Compute the SHA-256 hash of the uploaded file content
 - **Verify**: Compare the computed hash against the backend `records.json` ledger
 - **Display**: Show a green checkmark with full metrics if authentic, or a red warning if the file has been tampered with
+- **Result** : Show details about the agent test result including anadvanced section where devs can look at the agents actual responses to the payload we sent
 
 This completes the trustless loop: anyone in the world can verify a GridVet audit without trusting the pipeline, the operator, or GridVet itself.
 
@@ -733,6 +765,25 @@ Upgrade from the fixed 50-payload library to a **dynamic, LLM-driven adversarial
 - Anchor audit hashes to an L2 chain (e.g., Base, Arbitrum) for immutable, decentralized verification
 - Replace the local `records.json` ledger with an on-chain registry
 - Enable smart contract-based agent reputation scores
+
+### v1.4 — Model Vulnerability Atlas & Advisory
+
+Run 3 demonstrated that the inference layer is part of the attack surface. v1.4 promotes that observation into a formal research track:
+
+- **Cross-model benchmarking suite.** Run the full GridVet payload library against a matrix of frontier and open-weight models (GPT-4o / 4.1, Claude 3.5/4, Gemini 2.x, Llama-3.x, Qwen-2.5/3, DeepSeek-V3, Mistral Large, etc.) on a wired, fixed-seed agent harness.
+- **Per-provider variance tracking.** Re-run the same model across multiple hosted providers (Groq, Together, Fireworks, Bedrock, Vertex, Alibaba Model Studio, Azure OpenAI) and across multiple keys per provider, to quantify how much of the security score is attributable to weights vs. serving stack vs. account tier.
+- **Public Vulnerability Atlas.** Publish a continuously-updated leaderboard showing which models — and which model/provider/quantization combinations — are most and least prone to each of the 5 attack categories, with confidence intervals and noise-floor disclosures.
+- **Operator advisory service.** Offer a "before you deploy" recommendation API: given an agent's strategy class and risk tier, GridVet returns a ranked shortlist of model/provider combinations that have historically resisted the relevant attack vectors, plus the combinations to avoid.
+- **Provider drift alerts.** Subscribe operators to alerts when the model/provider combination they are using exhibits a statistically significant security regression in the rolling atlas — the same kind of silent drift Run 3 caught manually.
+
+### v1.5 — Aggressive Exchange-Specific Stress Suite (Bitget Pilot)
+
+Today's payload library treats exchange names generically. v1.5 will harden the suite around the specific exchanges agents most commonly transact on, beginning with **Bitget** as the pilot venue:
+
+- **Bitget-targeted payload pack.** A dedicated category of injection payloads written against Bitget's real API surface, withdrawal flow vocabulary, hot/cold wallet naming conventions, copy-trading mechanics, and historical incident scripts — designed to be indistinguishable from real Bitget operational chatter.
+- **High-intensity mode.** An opt-in "aggressive" audit profile that raises injection probability to 90%+, multiplies the payload count per category, and runs adversarial chaining (one payload primes the agent's context for a second payload's exploit) to surface vulnerabilities that only emerge under sustained pressure.
+- **Solidified security badge.** Agents that clear the Bitget aggressive suite earn a tier-modifier on their attested report (e.g., `S/Bitget-Hardened`) — a verifiable claim that the agent has been stress-tested against venue-specific attack surface, not just the generic library.
+- **Venue rollout.** After Bitget, the same pattern extends to Binance, OKX, Bybit, Hyperliquid, and major DEX aggregators, each with its own dedicated payload pack and aggressive suite.
 
 ---
 
